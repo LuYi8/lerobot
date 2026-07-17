@@ -104,12 +104,14 @@ class PandaArrangeBoxesGymEnv(FrankaGymEnv):
         self.reset_robot()
 
         positions_coords = np.linspace(-self.block_range, self.block_range, self.no_blocks)
-        np.random.shuffle(positions_coords)
-
+        #修改
+        #np.random.shuffle(positions_coords)
+        self.random_state.shuffle(positions_coords)
         # Sample a new block position
         blocks = [f"block{i}" for i in range(1, self.no_blocks + 1)]
-        np.random.shuffle(blocks)
-
+        #修改
+        #np.random.shuffle(blocks)
+        self.random_state.shuffle(blocks)
         for block, pos in zip(blocks, positions_coords, strict=False):
             block_x_coord = self._data.joint(block).qpos[0]
             block_coords = np.array([block_x_coord, pos])

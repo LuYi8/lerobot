@@ -9,7 +9,7 @@
             "control_mode": "keyboard",
             "observation": {
                 "add_joint_velocity_to_observation": true,
-                "display_cameras": true
+                "display_cameras": false
             },
             "image_preprocessing": null,
             "gripper": {
@@ -71,7 +71,7 @@
         "repo_id": "offline_dataset",
         "root": "./offline_dataset",
         "task": "PandaPickCubeKeyboard-v0",
-        "num_episodes_to_record": 30,
+        "num_episodes_to_record": 10,
         "replay_episode": 0,
         "push_to_hub": false
     },

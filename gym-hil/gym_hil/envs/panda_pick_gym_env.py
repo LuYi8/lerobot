@@ -110,7 +110,9 @@ class PandaPickCubeGymEnv(FrankaGymEnv):
 
         # Sample a new block position
         if self._random_block_position:
-            block_xy = np.random.uniform(*_SAMPLING_BOUNDS)
+            #修改
+            #block_xy = np.random.uniform(*_SAMPLING_BOUNDS)
+            block_xy = self.random_state.uniform(*_SAMPLING_BOUNDS)
             self._data.jnt("block").qpos[:3] = (*block_xy, self._block_z)
         else:
             block_xy = np.asarray([0.5, 0.0])
@@ -201,7 +203,7 @@ class PandaPickCubeGymEnv(FrankaGymEnv):
 if __name__ == "__main__":
     from gym_hil import PassiveViewerWrapper
 
-    env = PandaPickCubeGymEnv(render_mode="human")
+    env = PandaPickCubeGymEnv(seed=42, render_mode="human")
     env = PassiveViewerWrapper(env)
     env.reset()
     for _ in range(100):
