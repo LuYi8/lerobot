@@ -10,7 +10,7 @@
     "save_checkpoint": true,
     "save_freq": 4000,
     "wandb": {
-        "enable": true,
+        "enable": false,
         "project": "hil_test",
         "disable_artifact": true
     },
@@ -136,7 +136,7 @@
         },
         "num_discrete_actions": 3,
         "storage_device": "cpu",
-        "vision_encoder_name": "lerobot/resnet10",
+        "vision_encoder_name": "/home/embody/lerobot/resnet10",
         "freeze_vision_encoder": true,
         "image_encoder_hidden_dim": 32,
         "shared_encoder": true,
