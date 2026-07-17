@@ -3,7 +3,7 @@
     "job_name": "default",
     "resume": false,
     "seed": 1000,
-    "num_workers": 12,
+    "num_workers": 0,
     "batch_size": 256,
     "steps": 8500,
     "log_freq": 1,
@@ -17,7 +17,8 @@
     "dataset": {
         "repo_id": "offline_dataset",
         "root": "/home/embody/lerobot/gym-hil/offline_dataset",
-        "use_imagenet_stats": false
+        "use_imagenet_stats": false,
+            "video_backend": "pyav" 
     },
     "algorithm": {
         "type": "sac",
@@ -75,7 +76,7 @@
         "output_features": {
             "action": {
                 "type": "ACTION",
-                "shape": [3]
+                "shape": [4]
             }
         },
         "dataset_stats": {
@@ -130,8 +131,8 @@
                 ]
             },
             "action": {
-                "min": [-1.0, -1.0, -1.0],
-                "max": [1.0, 1.0, 1.0]
+                "min": [-1.0, -1.0, -1.0, 1.0],
+                "max": [1.0, 1.0, 1.0, 2.0]
             }
         },
         "num_discrete_actions": 3,
@@ -141,8 +142,8 @@
         "image_encoder_hidden_dim": 32,
         "shared_encoder": true,
         "online_steps": 1000000,
-        "online_buffer_capacity": 100000,
-        "offline_buffer_capacity": 100000,
+        "online_buffer_capacity": 5000,
+        "offline_buffer_capacity": 5000,
         "online_step_before_learning": 100,
         "state_encoder_hidden_dim": 256,
         "latent_dim": 64,
@@ -217,7 +218,7 @@
             },
             "action": {
                 "type": "ACTION",
-                "shape": [3]
+                "shape": [4]
             }
         },
         "features_map": {

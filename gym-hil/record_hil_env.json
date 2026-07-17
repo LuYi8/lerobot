@@ -68,8 +68,8 @@
         }
     },
     "dataset": {
+        "root": "/home/embody/lerobot/gym-hil/offline_dataset",
         "repo_id": "offline_dataset",
-        "root": "./offline_dataset",
         "task": "PandaPickCubeKeyboard-v0",
         "num_episodes_to_record": 30,
         "replay_episode": 0,

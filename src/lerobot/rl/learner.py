@@ -247,6 +247,8 @@ def start_learner_threads(
         )
         logging.info("[LEARNER] Training process stopped")
     except Exception:
+        import traceback
+        traceback.print_exc()
         logging.exception("[LEARNER] Unhandled exception in training loop")
         shutdown_event.set()
     finally:
@@ -890,7 +892,7 @@ def check_nan_in_transition(
 
     Returns:
         bool: True if NaN values were detected, False otherwise
-    """
+-+    """
     nan_detected = False
 
     # Check observations

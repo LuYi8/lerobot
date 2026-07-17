@@ -1,9 +1,10 @@
-record: python -m lerobot.rl.gym_manipulator --config_path /home/embody/lerobot/gym-hil/record_hil_env.json
+record:
+python -m lerobot.rl.gym_manipulator --config_path /home/embody/lerobot/gym-hil/record_hil_env.json
 
 
 learner: 
-python -m lerobot.rl.learner --config_path /home/embody/lerobot/gym-hil/train_hil_env.json --resume false
+python -m lerobot.rl.learner --config_path /home/embody/lerobot/gym-hil/train_hil_env.json --resume false 2>&1 | tee full_trace.log
 
 
-actor: 
+actor: `	qa<
 python -m lerobot.rl.actor --config_path /home/embody/lerobot/gym-hil/train_hil_env.json --resume true

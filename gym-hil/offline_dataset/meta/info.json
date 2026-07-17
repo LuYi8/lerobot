@@ -139,7 +139,7 @@
         }
     },
     "total_episodes": 30,
-    "total_frames": 711,
+    "total_frames": 703,
     "total_tasks": 1,
     "chunks_size": 1000,
     "data_files_size_in_mb": 100,
