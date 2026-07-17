@@ -71,7 +71,7 @@
         "repo_id": "offline_dataset",
         "root": "./offline_dataset",
         "task": "PandaPickCubeKeyboard-v0",
-        "num_episodes_to_record": 10,
+        "num_episodes_to_record": 5,
         "replay_episode": 0,
         "push_to_hub": false
     },

@@ -103,7 +103,7 @@ class GymManipulatorConfig:
     dataset: DatasetConfig
     mode: str | None = None  # Either "record", "replay", None
     device: str = "cpu"
-
+    seed: int = 12345
 
 def reset_follower_position(robot_arm: Robot, target_position: np.ndarray) -> None:
     """Reset robot arm to target position using smooth trajectory."""
@@ -559,7 +559,14 @@ def step_env_and_process_transition(
     processed_action = processed_action_transition[TransitionKey.ACTION]
 
     obs, reward, terminated, truncated, info = env.step(processed_action)
-
+    #修改
+    # 强制驱动渲染管线（主线程）
+    if hasattr(env, "render"):
+        try:
+            _ = env.render()
+        except Exception:
+            pass
+    #结束
     reward = reward + processed_action_transition[TransitionKey.REWARD]
     terminated = terminated or processed_action_transition[TransitionKey.DONE]
     truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
@@ -799,6 +806,11 @@ def replay_trajectory(
         )
         transition = action_processor(transition)
         env.step(transition[TransitionKey.ACTION])
+        if hasattr(env, "render"):
+            try:
+                _ = env.render()
+            except Exception:
+                pass
         precise_sleep(max(1 / cfg.env.fps - (time.perf_counter() - start_time), 0.0))
 
 
