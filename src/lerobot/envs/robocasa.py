@@ -151,7 +151,12 @@ class RoboCasaEnv(gym.Env):
         # seed across factories so each sub-env explores a distinct layout
         # even when the same seed is passed to `reset()`.
         self.episode_index = int(episode_index)
-
+        #修改
+        # Count how many times reset() has been called for this env instance.
+        # Used to derive per-reset seeds so object placement changes every reset
+        # while remaining reproducible for a fixed base seed
+        self._reset_count = 0
+        #修改结束
         self.camera_name = parse_camera_names(camera_name)
 
         self._max_episode_steps = episode_length if episode_length is not None else 1000
@@ -257,7 +262,24 @@ class RoboCasaEnv(gym.Env):
         # episode_index; with no seed we fall back to episode_index so
         # each worker is still distinct rather than inheriting the same
         # global RNG state.
-        worker_seed = seed + self.episode_index if seed is not None else self.episode_index
+        #修改
+        #worker_seed = seed + self.episode_index if seed is not None else self.episode_index
+        # Per-reset deterministic seeding:
+        # - Same user seed + same reset order => reproducible object layouts.
+        # - Different reset calls => different layouts (via _reset_count).
+        # - Different workers => different streams (via episode_index).
+        #
+        # seed is the user-provided base seed from caller/env manager.
+        # episode_index is the per-worker offset (0..n_envs-1).
+        # _reset_count advances on every reset within this worker.
+        if seed is None:
+            base_seed = self.episode_index
+        else:
+            base_seed = int(seed) + self.episode_index
+
+        worker_seed = base_seed + self._reset_count
+        self._reset_count += 1
+        #修改结束
         raw_obs, info = self._env.reset(seed=worker_seed)
 
         ep_meta = self._env.env.get_ep_meta()
