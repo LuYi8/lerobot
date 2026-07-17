@@ -892,7 +892,7 @@ def check_nan_in_transition(
 
     Returns:
         bool: True if NaN values were detected, False otherwise
--+    """
+    """
     nan_detected = False
 
     # Check observations

@@ -590,7 +590,19 @@ class ReplayBuffer:
                     # Non-tensor values can be used directly
                     else:
                         frame_dict[f"complementary_info.{key}"] = val
-
+            #修改
+            for key, value in frame_dict.items():
+                if key.startswith("observation.images."):   # 识别图像键
+                    if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
+                        # 检查值范围，若最大值 > 1 则视为 [0,255]，否则视为 [0,1]
+                        if value.max() > 1.0:
+                            # 直接 clamp 并转为 uint8
+                            frame_dict[key] = value.clamp(0, 255).byte()
+                        else:
+                            # 归一化到 [0,255]
+                            frame_dict[key] = (value * 255).clamp(0, 255).byte()
+                    # 如果已经是 uint8 则无需处理
+            #结束
             # Add to the dataset's buffer
             lerobot_dataset.add_frame(frame_dict)
 
