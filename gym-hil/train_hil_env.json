@@ -1,11 +1,11 @@
 {
     "output_dir": "/home/embody/lerobot/gym-hil/checkpoint",
     "job_name": "default",
-    
+
     "seed": 1000,
-    "num_workers": 0,
-    "batch_size": 256,
-    "steps": 8500,
+    "num_workers": 8,
+    "batch_size": 64,
+    "steps": 10000,
     "log_freq": 1,
     "save_checkpoint": true,
     "save_freq": 1000,
@@ -141,7 +141,7 @@
         "freeze_vision_encoder": true,
         "image_encoder_hidden_dim": 32,
         "shared_encoder": true,
-        "online_steps": 1000000,
+        "online_steps": 10000,
         "online_buffer_capacity": 5000,
         "offline_buffer_capacity": 5000,
         "online_step_before_learning": 100,

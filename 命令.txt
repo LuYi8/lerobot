@@ -7,7 +7,7 @@ python -m lerobot.rl.learner --config_path /home/embody/lerobot/gym-hil/train_hi
 
 
 actor:
-python -m lerobot.rl.actor --config_path /home/embody/lerobot/gym-hil/train_hil_env.json --resume true  2>&1 | tee actor_trace.log
+python -m lerobot.rl.actor --config_path /home/embody/lerobot/gym-hil/train_hil_env.json --resume true 2>&1 | tee actor_trace.log
 
 (删除checkpoint)
 python -m lerobot.rl.actor --config_path /home/embody/lerobot/gym-hil/train_hil_env.json  2>&1 | tee actor_=trace.log
