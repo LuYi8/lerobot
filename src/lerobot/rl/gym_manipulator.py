@@ -804,21 +804,25 @@ def replay_trajectory(
 
 @parser.wrap()
 def main(cfg: GymManipulatorConfig) -> None:
-    """Main entry point for gym manipulator script."""
-    env, teleop_device = make_robot_env(cfg.env)
-    env_processor, action_processor = make_processors(env, teleop_device, cfg.env, cfg.device)
+    try:
+        """Main entry point for gym manipulator script."""
+        env, teleop_device = make_robot_env(cfg.env)
+        env_processor, action_processor = make_processors(env, teleop_device, cfg.env, cfg.device)
 
-    print("Environment observation space:", env.observation_space)
-    print("Environment action space:", env.action_space)
-    print("Environment processor:", env_processor)
-    print("Action processor:", action_processor)
+        print("Environment observation space:", env.observation_space)
+        print("Environment action space:", env.action_space)
+        print("Environment processor:", env_processor)
+        print("Action processor:", action_processor)
 
-    if cfg.mode == "replay":
-        replay_trajectory(env, action_processor, cfg)
-        exit()
+        if cfg.mode == "replay":
+            replay_trajectory(env, action_processor, cfg)
+            exit()
 
-    control_loop(env, env_processor, action_processor, teleop_device, cfg)
+        control_loop(env, env_processor, action_processor, teleop_device, cfg)
 
-
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise   # 可选：打印后重新抛出，终止程序；若希望继续运行则移除 raise
 if __name__ == "__main__":
     main()

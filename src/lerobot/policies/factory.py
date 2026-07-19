@@ -640,6 +640,9 @@ def make_policy(
 
     else:
         # Make a fresh policy.
+        #修改
+        # 移除 dataset_stats，因为它已经存在于 cfg.policy 中
+        kwargs.pop('dataset_stats', None)
         policy = policy_cls(**kwargs)
 
     policy.to(cfg.device)

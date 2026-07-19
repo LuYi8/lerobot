@@ -7,7 +7,15 @@ python -m lerobot.rl.learner --config_path /home/embody/lerobot/gym-hil/train_hi
 
 
 actor:
-python -m lerobot.rl.actor --config_path /home/embody/lerobot/gym-hil/train_hil_env.json --resume true 2>&1 | tee actor_trace.log
+从头开始(删除checkpoint)
+python -m lerobot.rl.actor --config_path /home/embody/lerobot/gym-hil/actor_hil_env.json 2>&1 | tee actor_trace.log
 
-(删除checkpoint)
-python -m lerobot.rl.actor --config_path /home/embody/lerobot/gym-hil/train_hil_env.json  2>&1 | tee actor_=trace.log
+继续训练(删除output_actor)
+python -m lerobot.rl.actor --config_path /home/embody/lerobot/gym-hil/actor_hil_env.json --policy.pretrained_path "/home/embody/lerobot/gym-hil/output/checkpoints/last/pretrained_model" 2>&1 | tee actor_trace.log
+
+评估
+最后的检查点
+#python -m lerobot.rl.eval_policy --config_path /home/embody/lerobot/gym-hil/actor_hil_env.json --policy.pretrained_path /home/embody/lerobot/gym-hil/output/checkpoints/last/pretrained_model 2>&1 | tee eval_policy_debug.log
+
+自定义检查点
+python -m lerobot.rl.eval_simple     --config_path /home/embody/lerobot/gym-hil/actor_hil_env.json     --policy.pretrained_path /home/embody/lerobot/gym-hil/output/checkpoints/006000/pretrained_model     --eval.n_episodes 10     --policy.device cuda

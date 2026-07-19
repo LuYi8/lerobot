@@ -320,8 +320,8 @@ def act_with_policy(
             # Unnormalize only the continuous part.
             if cfg.policy.num_discrete_actions is not None:
                 #修改
-                #continuous_action = postprocessor.process_action(action[..., :-1])
-                continuous_action = postprocessor.process_action(action)
+                continuous_action = postprocessor.process_action(action[..., :-1])
+                #continuous_action = postprocessor.process_action(action)
                 #结束
                 discrete_action = action[..., -1:].to(
                     device=continuous_action.device, dtype=continuous_action.dtype

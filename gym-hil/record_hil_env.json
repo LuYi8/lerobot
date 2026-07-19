@@ -14,7 +14,7 @@
             "image_preprocessing": null,
             "gripper": {
                 "use_gripper": true,
-                "gripper_penalty": -0.02
+                "gripper_penalty": -0.2
             },
             "reset": {
                 "fixed_reset_joint_positions": [
@@ -27,7 +27,8 @@
                     0.785
                 ],
                 "reset_time_s": 1.0,
-                "control_time_s": 30.0
+                "control_time_s": 8.0,
+                "terminate_on_success": true
             }
         },
         "features": {
@@ -68,8 +69,8 @@
         }
     },
     "dataset": {
-        "root": "/home/embody/lerobot/gym-hil/offline_dataset",
-        "repo_id": "offline_dataset",
+        "root": "/home/embody/lerobot/gym-hil/dataset",
+        "repo_id": "/home/embody/lerobot/gym-hil/dataset",
         "task": "PandaPickCubeKeyboard-v0",
         "num_episodes_to_record": 30,
         "replay_episode": 0,
