@@ -14,6 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 
 import logging
 import time
@@ -52,7 +53,7 @@ class LearnerService(_ServicerBase):
 
     def __init__(
         self,
-        shutdown_event: Event,  # type: ignore
+        shutdown_event: Event,
         parameters_queue: Queue,
         seconds_between_pushes: float,
         transition_queue: Queue,
@@ -65,43 +66,48 @@ class LearnerService(_ServicerBase):
         self.transition_queue = transition_queue
         self.interaction_message_queue = interaction_message_queue
         self.queue_get_timeout = queue_get_timeout
+        # 【新增】缓存上一次发送的权重哈希，用于去重
+        self._last_params_hash = None
 
-    def StreamParameters(  # noqa: N802
-        self, request: "services_pb2.Empty", context: "grpc.ServicerContext"
-    ):
-        # TODO: authorize the request
+
+    def StreamParameters(self, request: "services_pb2.Empty", context: "grpc.ServicerContext"):
         logging.info("[LEARNER] Received request to stream parameters from the Actor")
-
         last_push_time = 0
-
         while not self.shutdown_event.is_set():
             time_since_last_push = time.time() - last_push_time
             if time_since_last_push < self.seconds_between_pushes:
                 self.shutdown_event.wait(self.seconds_between_pushes - time_since_last_push)
-                # Continue, because we could receive a shutdown event,
-                # and it's checked in the while loop
                 continue
 
-            logging.info("[LEARNER] Push parameters to the Actor")
+            # 从队列取最新权重
             buffer = get_last_item_from_queue(
                 self.parameters_queue, block=True, timeout=self.queue_get_timeout
             )
-
             if buffer is None:
                 continue
 
+            # 计算当前权重哈希，和上一次对比
+            current_hash = hashlib.md5(buffer).hexdigest()
+            if current_hash == self._last_params_hash:
+                # 权重未变化，跳过发送，不打日志
+                last_push_time = time.time()
+                continue
+
+            # 权重有更新，才执行推送
+            logging.debug("[LEARNER] Push parameters to the Actor")
             yield from send_bytes_in_chunks(
                 buffer,
                 services_pb2.Parameters,
                 log_prefix="[LEARNER] Sending parameters",
                 silent=True,
             )
-
+            self._last_params_hash = current_hash
             last_push_time = time.time()
-            logging.info("[LEARNER] Parameters sent")
+            logging.debug("[LEARNER] Parameters sent")
 
         logging.info("[LEARNER] Stream parameters finished")
         return services_pb2.Empty()
+
 
     def SendTransitions(self, request_iterator, _context: "grpc.ServicerContext"):  # noqa: N802
         # TODO: authorize the request

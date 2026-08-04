@@ -32,11 +32,19 @@ class GripperPenaltyWrapper(gym.Wrapper):
         self.penalty = penalty
         self.last_gripper_pos = None
 
+    # def reset(self, **kwargs):
+    #     obs, info = self.env.reset(**kwargs)
+    #     self.last_gripper_pos = self.unwrapped.get_gripper_pose() / MAX_GRIPPER_COMMAND
+    #     return obs, info
     def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        self.last_gripper_pos = self.unwrapped.get_gripper_pose() / MAX_GRIPPER_COMMAND
-        return obs, info
-
+        for retry in range(3):
+            try:
+                obs, info = self.env.reset(**kwargs)
+                self.last_gripper_pos = self.unwrapped.get_gripper_pose() / MAX_GRIPPER_COMMAND
+                return obs, info
+            except Exception as e:
+                logging.warning(f"环境重置失败，第{retry+1}次重试：{e}")
+        raise RuntimeError("环境重置连续失败")
     def step(self, action):
         observation, reward, terminated, truncated, info = self.env.step(action)
 

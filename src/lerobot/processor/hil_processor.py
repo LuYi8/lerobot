@@ -494,7 +494,7 @@ class InterventionActionProcessorStep(ProcessorStep):
         # Override action if intervention is active
         if is_intervention and teleop_action is not None:
             if isinstance(teleop_action, dict):
-                # Convert teleop_action dict to tensor format
+                # 字典格式：提取平动+夹爪分量，构造数值列表
                 action_list = [
                     teleop_action.get("delta_x", 0.0),
                     teleop_action.get("delta_y", 0.0),
@@ -502,13 +502,37 @@ class InterventionActionProcessorStep(ProcessorStep):
                 ]
                 if self.use_gripper:
                     action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
-            elif isinstance(teleop_action, np.ndarray):
-                action_list = teleop_action.tolist()
-            else:
-                action_list = teleop_action
+                teleop_action_tensor = torch.tensor(
+                    action_list, dtype=action.dtype, device=action.device
+                ).detach()
 
-            teleop_action_tensor = torch.tensor(action_list, dtype=action.dtype, device=action.device)
+            elif isinstance(teleop_action, torch.Tensor):
+                # 原生张量：直接迁移设备类型，压缩多余维度，确保一维
+                teleop_action_tensor = teleop_action.to(
+                    dtype=action.dtype, device=action.device
+                ).squeeze().detach()
+
+            elif isinstance(teleop_action, np.ndarray):
+                # numpy 数组：转张量后对齐格式
+                teleop_action_tensor = torch.from_numpy(teleop_action).to(
+                    dtype=action.dtype, device=action.device
+                ).squeeze().detach()
+
+            elif isinstance(teleop_action, (list, tuple)):
+                # Python 列表/元组：直接构造张量
+                teleop_action_tensor = torch.tensor(
+                    teleop_action, dtype=action.dtype, device=action.device
+                ).detach()
+
+            else:
+                # 未知类型抛出明确错误，方便排查
+                raise TypeError(
+                    f"Unsupported teleop_action type: {type(teleop_action)}. "
+                    f"Supported: dict, torch.Tensor, np.ndarray, list, tuple"
+                )
+
             new_transition[TransitionKey.ACTION] = teleop_action_tensor
+
 
         # Handle episode termination
         new_transition[TransitionKey.DONE] = bool(terminate_episode) or (

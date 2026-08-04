@@ -64,7 +64,9 @@ class RLAlgorithm(HubMixin, abc.ABC):
         data_mixer: DataMixer,
         batch_size: int,
         *,
-        async_prefetch: bool = True,
+        #关闭异步预取
+        #async_prefetch: bool = True,
+        async_prefetch: bool = False,
         queue_size: int = 2,
     ) -> Iterator[BatchType]:
         """Create the data iterator this algorithm needs.

@@ -1,7 +1,5 @@
 #!/usr/bin/env python
-
-# Copyright 2025 The HuggingFace Inc. team.
-# All rights reserved.
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,6 +35,7 @@ def is_image_feature(key: str) -> bool:
 @dataclass
 class ConcurrencyConfig:
     """Configuration for the concurrency of the actor and learner.
+
     Possible values are:
     - "threads": Use threads for the actor and learner.
     - "processes": Use processes for the actor and learner.
@@ -82,12 +81,15 @@ class GaussianActorConfig(PreTrainedConfig):
 
     This configures the policy-side (actor + observation encoder) of a Gaussian
     policy, as used by SAC and related maximum-entropy continuous-control algorithms.
+
     By default the actor output is a tanh-squashed diagonal Gaussian
     (``TanhMultivariateNormalDiag``); the tanh squashing can be disabled via
     ``policy_kwargs.use_tanh_squash``. The critics, temperature, and Bellman-update
     logic live on the algorithm side (see ``lerobot.rl.algorithms.sac``).
 
     CLI: ``--policy.type=gaussian_actor``.
+
+    [GRU改造] 新增 GRU 时序模块配置，默认关闭，兼容原有单步模式。
     """
 
     # Mapping of feature types to normalization modes
@@ -123,6 +125,7 @@ class GaussianActorConfig(PreTrainedConfig):
     device: str = "cpu"
     # Device to store the model on
     storage_device: str = "cpu"
+
     # Name of the vision encoder model (Set to "lerobot/resnet10" for hil serl resnet10)
     vision_encoder_name: str | None = None
     # Whether to freeze the vision encoder during training
@@ -131,8 +134,10 @@ class GaussianActorConfig(PreTrainedConfig):
     image_encoder_hidden_dim: int = 32
     # Whether to use a shared encoder for actor and critic
     shared_encoder: bool = True
+
     # Number of discrete actions, eg for gripper actions
     num_discrete_actions: int | None = None
+
     # Dimension of the image embedding pooling
     image_embedding_pooling_dim: int = 8
 
@@ -141,6 +146,17 @@ class GaussianActorConfig(PreTrainedConfig):
     state_encoder_hidden_dim: int = 256
     # Dimension of the latent space
     latent_dim: int = 256
+
+    # ========== 【GRU改造新增】时序模块配置 ==========
+    # Whether to enable GRU temporal encoder for sequential observations
+    # Default False to maintain full backward compatibility
+    use_gru: bool = False
+    # Hidden dimension size of the GRU layer
+    gru_hidden_size: int = 64
+    # Number of stacked GRU layers
+    num_gru_layers: int = 2
+    # Dropout rate applied between GRU layers
+    gru_dropout: float = 0.1
 
     # Online training (TODO(Khalil): relocate to TrainRLServerPipelineConfig)
     # Number of steps for online training
@@ -169,7 +185,14 @@ class GaussianActorConfig(PreTrainedConfig):
     discrete_critic_network_kwargs: CriticNetworkConfig = field(default_factory=CriticNetworkConfig)
 
     def __post_init__(self):
-        super().__post_init__()
+        # GRU 模式参数合法性校验
+        if self.use_gru:
+            if self.gru_hidden_size <= 0:
+                raise ValueError("gru_hidden_size must be positive when use_gru=True")
+            if self.num_gru_layers < 1:
+                raise ValueError("num_gru_layers must be at least 1 when use_gru=True")
+            if self.gru_dropout < 0.0 or self.gru_dropout >= 1.0:
+                raise ValueError("gru_dropout must be in [0.0, 1.0)")
         # Any validation specific to GaussianActor configuration
 
     def get_optimizer_preset(self) -> MultiAdamConfig:
@@ -194,12 +217,10 @@ class GaussianActorConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         has_image = any(is_image_feature(key) for key in self.input_features)
         has_state = OBS_STATE in self.input_features
-
         if not (has_state or has_image):
             raise ValueError(
                 "You must provide either 'observation.state' or an image observation (key starting with 'observation.image') in the input features"
             )
-
         if ACTION not in self.output_features:
             raise ValueError("You must provide 'action' in the output features")
 

@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -39,6 +38,9 @@ class SACAlgorithmConfig(RLAlgorithmConfig):
     update loop. The policy-side (actor + observation encoder) lives in
     :class:`~lerobot.policies.gaussian_actor.GaussianActorConfig` and is
     referenced via :attr:`policy_config`.
+
+    [GRU改造] 新增序列训练与 Critic GRU 配置，默认关闭，兼容原有单步 SAC 模式。
+    开启后配合 replay buffer 的序列 chunk 采样与 GRU 策略网络，实现完整 GRU-SAC 训练。
     """
 
     # Optimizer learning rates
@@ -67,6 +69,15 @@ class SACAlgorithmConfig(RLAlgorithmConfig):
     # Configuration for the discrete critic network
     discrete_critic_network_kwargs: CriticNetworkConfig = field(default_factory=CriticNetworkConfig)
 
+    # ========== 【GRU改造新增】Critic 侧 GRU 网络结构参数 ==========
+    # Hidden dimension size of the GRU layer in each critic head
+    # Only effective when use_sequence=True
+    critic_gru_hidden_size: int = 64
+    # Number of stacked GRU layers in each critic head
+    num_critic_gru_layers: int = 2
+    # Dropout rate applied between GRU layers in critics
+    critic_gru_dropout: float = 0.1
+
     # Temperature / entropy
     # Initial temperature value
     temperature_init: float = 1.0
@@ -74,6 +85,20 @@ class SACAlgorithmConfig(RLAlgorithmConfig):
     # ``-|A|/2`` where ``|A|`` is the total action dimension (continuous + 1 if
     # there is a discrete action head).
     target_entropy: float | None = None
+
+    # ========== 【GRU改造新增】序列训练超参数 ==========
+    # Whether to enable sequence chunk sampling and GRU temporal critics
+    # Set to True for GRU-SAC training; False for standard single-step SAC
+    # NOTE: Sequence mode does not currently support discrete action heads.
+    #       Ensure policy.num_discrete_actions is None when enabling this flag.
+    use_sequence: bool = False
+    # Length of sampled sequence chunks from replay buffer
+    # Required and only effective when use_sequence=True
+    seq_len: int = 32
+    # Truncated backpropagation through time (BPTT) length
+    # [Reserved] Not yet implemented; currently backpropagates through full seq_len
+    # None = backpropagate through the full seq_len; int value = only backprop last N steps
+    bptt_truncate_len: int | None = None
 
     # Update loop
     # Update-to-data ratio. Set to >1 to enable extra critic updates per env step.
@@ -87,13 +112,27 @@ class SACAlgorithmConfig(RLAlgorithmConfig):
     # torch.compile is currently disabled by default
     use_torch_compile: bool = False
 
+    def __post_init__(self):
+        if self.use_sequence:
+            if self.seq_len <= 0:
+                raise ValueError("seq_len must be positive when use_sequence=True")
+            if self.bptt_truncate_len is not None:
+                if self.bptt_truncate_len <= 0:
+                    raise ValueError("bptt_truncate_len must be positive")
+                if self.bptt_truncate_len > self.seq_len:
+                    raise ValueError("bptt_truncate_len cannot be larger than seq_len")
     # Policy config
     policy_config: PreTrainedConfig | None = None
 
     @classmethod
     def from_policy_config(cls, policy_cfg: GaussianActorConfig) -> SACAlgorithmConfig:
-        """Build an algorithm config with default hyperparameters for a given policy."""
+        """Build an algorithm config with default hyperparameters for a given policy.
+        Auto-enables sequence mode if the policy config has GRU enabled.
+        """
+        # 自动联动：策略开启GRU时，算法默认开启序列模式
+        use_sequence = getattr(policy_cfg, "use_gru", False)
         return cls(
             policy_config=policy_cfg,
             discrete_critic_network_kwargs=policy_cfg.discrete_critic_network_kwargs,
+            use_sequence=use_sequence,
         )

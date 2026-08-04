@@ -69,8 +69,8 @@
         }
     },
     "dataset": {
-        "root": "/home/embody/lerobot/gym-hil/dataset",
-        "repo_id": "/home/embody/lerobot/gym-hil/dataset",
+        "root": "/home/embody/lerobot/gym-hil/dataset_test",
+        "repo_id": "/home/embody/lerobot/gym-hil/dataset_test",
         "task": "PandaPickCubeKeyboard-v0",
         "num_episodes_to_record": 30,
         "replay_episode": 0,

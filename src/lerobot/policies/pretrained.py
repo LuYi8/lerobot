@@ -30,7 +30,7 @@ from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 from safetensors.torch import load_model as load_model_as_safetensor, save_model as save_model_as_safetensor
 from torch import Tensor, nn
-
+import torch
 from lerobot.__version__ import __version__
 from lerobot.configs import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
@@ -149,14 +149,30 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
     def _save_pretrained(self, save_directory: Path, state_dict: dict[str, Tensor] | None = None) -> None:
         self.config._save_pretrained(save_directory)
         model_to_save = self.module if hasattr(self, "module") else self
+
+        # 1. 统一获取 state_dict
         if state_dict is None:
-            save_model_as_safetensor(model_to_save, str(save_directory / SAFETENSORS_SINGLE_FILE))
-            return
-        # A pre-gathered (e.g. FSDP full) state dict was supplied: write it directly.
-        # `save_torch_state_dict` discards shared-tensor duplicates just like `save_model` does;
-        # pin `max_shard_size` above the total size so the output stays a single `model.safetensors`
-        total_bytes = sum(t.numel() * t.element_size() for t in state_dict.values())
-        save_torch_state_dict(state_dict, str(save_directory), max_shard_size=max(total_bytes, 1))
+            state_dict = model_to_save.state_dict()
+
+        # 2. 全局清洗：打破所有张量的共享存储，彻底兼容safetensors
+        clean_state_dict = {}
+        for key, tensor in state_dict.items():
+            if isinstance(tensor, torch.Tensor):
+                # contiguous 保证内存连续，clone 生成独立存储，彻底解除共享
+                clean_state_dict[key] = tensor.detach().contiguous().clone()
+            else:
+                clean_state_dict[key] = tensor
+
+        # 3. 计算总大小，保证单文件输出
+        total_bytes = sum(t.numel() * t.element_size() for t in clean_state_dict.values())
+        
+        # 4. 执行保存
+        save_torch_state_dict(
+            clean_state_dict,
+            str(save_directory),
+            max_shard_size=max(total_bytes, 1)
+        )
+
 
     @classmethod
     def from_pretrained(

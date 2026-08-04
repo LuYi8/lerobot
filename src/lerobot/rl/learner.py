@@ -442,8 +442,9 @@ def add_actor_information_and_train(
         # Calculate and log optimization frequency
         time_for_one_optimization_step = time.time() - time_for_one_optimization_step
         frequency_for_one_optimization_step = 1 / (time_for_one_optimization_step + 1e-9)
-
-        logging.info(f"[LEARNER] Optimization frequency loop [Hz]: {frequency_for_one_optimization_step}")
+        # 仅每10步打印一次调试信息
+        if optimization_step % 10 == 0:
+            logging.info(f"[LEARNER] Optimization frequency loop [Hz]: {frequency_for_one_optimization_step}")
 
         # Log optimization frequency
         if wandb_logger:
@@ -791,15 +792,18 @@ def initialize_replay_buffer(
 ) -> ReplayBuffer:
     """
     Initialize a replay buffer, either empty or from a dataset if resuming.
-
+    [GRU 改造] 透传序列模式参数，支持 GRU-SAC 序列采样训练。
     Args:
         cfg (TrainRLServerPipelineConfig): Training configuration
         device (str): Device to store tensors on
         storage_device (str): Device for storage optimization
-
     Returns:
         ReplayBuffer: Initialized replay buffer
     """
+    # ========== 【GRU 改造新增】从算法配置读取序列参数，兼容旧配置 ==========
+    use_sequence = getattr(cfg.algorithm, "use_sequence", False)
+    seq_len = getattr(cfg.algorithm, "seq_len", 32)
+
     if not cfg.resume:
         return ReplayBuffer(
             capacity=cfg.policy.online_buffer_capacity,
@@ -807,11 +811,12 @@ def initialize_replay_buffer(
             state_keys=cfg.policy.input_features.keys(),
             storage_device=storage_device,
             optimize_memory=True,
+            # ========== 【GRU 改造新增】透传序列参数 ==========
+            use_sequence=use_sequence,
+            seq_len=seq_len,
         )
-
     logging.info("Resume training load the online dataset")
     dataset_path = os.path.join(cfg.output_dir, "dataset")
-
     # NOTE: In RL is possible to not have a dataset.
     repo_id = None
     if cfg.dataset is not None:
@@ -826,6 +831,9 @@ def initialize_replay_buffer(
         device=device,
         state_keys=cfg.policy.input_features.keys(),
         optimize_memory=True,
+        # ========== 【GRU 改造新增】恢复训练时同步加载序列模式 ==========
+        use_sequence=use_sequence,
+        seq_len=seq_len,
     )
 
 
@@ -836,15 +844,18 @@ def initialize_offline_replay_buffer(
 ) -> ReplayBuffer:
     """
     Initialize an offline replay buffer from a dataset.
-
+    [GRU 改造] 透传序列模式参数，离线数据集自动按 episode 归档。
     Args:
         cfg (TrainRLServerPipelineConfig): Training configuration
         device (str): Device to store tensors on
         storage_device (str): Device for storage optimization
-
     Returns:
         ReplayBuffer: Initialized offline replay buffer
     """
+    # ========== 【GRU 改造新增】复用算法配置的序列参数 ==========
+    use_sequence = getattr(cfg.algorithm, "use_sequence", False)
+    seq_len = getattr(cfg.algorithm, "seq_len", 32)
+
     if not cfg.resume:
         logging.info("make_dataset offline buffer")
         offline_dataset = make_dataset(cfg)
@@ -855,7 +866,6 @@ def initialize_offline_replay_buffer(
             repo_id=cfg.dataset.repo_id,
             root=dataset_offline_path,
         )
-
     logging.info("Convert to a offline replay buffer")
     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
         offline_dataset,
@@ -864,6 +874,9 @@ def initialize_offline_replay_buffer(
         storage_device=storage_device,
         optimize_memory=True,
         capacity=cfg.policy.offline_buffer_capacity,
+        # ========== 【GRU 改造新增】透传序列参数 ==========
+        use_sequence=use_sequence,
+        seq_len=seq_len,
     )
     return offline_replay_buffer
 

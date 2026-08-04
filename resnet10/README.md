@@ -53,7 +53,7 @@ https://github.com/helper2424/resnet10
 ## Usage
 ```python
 from transformers import AutoModel, AutoTokenizer
-model = AutoModel.from_pretrained("lilkm/resnet10")
+model = AutoModel.from_pretrained("helper2424/resnet10")
 ```
 
 ## Citation

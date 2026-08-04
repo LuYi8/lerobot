@@ -1,0 +1,105 @@
+{
+    "codebase_version": "v3.0",
+    "fps": 10,
+    "features": {
+        "index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "episode_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "frame_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "timestamp": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "task_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": [
+                4
+            ]
+        },
+        "next.reward": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ]
+        },
+        "next.done": {
+            "dtype": "bool",
+            "shape": [
+                1
+            ]
+        },
+        "observation.images.front": {
+            "dtype": "image",
+            "shape": [
+                3,
+                128,
+                128
+            ]
+        },
+        "observation.images.wrist": {
+            "dtype": "image",
+            "shape": [
+                3,
+                128,
+                128
+            ]
+        },
+        "observation.state": {
+            "dtype": "float32",
+            "shape": [
+                18
+            ]
+        },
+        "complementary_info.discrete_penalty": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ]
+        },
+        "complementary_info.is_intervention": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ]
+        }
+    },
+    "total_episodes": 176,
+    "total_frames": 8000,
+    "total_tasks": 1,
+    "chunks_size": 1000,
+    "data_files_size_in_mb": 100,
+    "video_files_size_in_mb": 200,
+    "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+    "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+    "robot_type": null,
+    "splits": {
+        "train": "0:176"
+    }
+}

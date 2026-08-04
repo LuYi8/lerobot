@@ -12,6 +12,7 @@
 # limitations under the License.
 """ResNet model configuration"""
 
+
 from transformers import PretrainedConfig
 
 

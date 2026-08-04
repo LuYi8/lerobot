@@ -49,16 +49,19 @@ def predict_action(
     use_amp: bool,
     task: str | None = None,
     robot_type: str | None = None,
+    # ========== 【GRU 改造新增】可选隐藏态参数 ==========
+    # 传入则使用外部管理的隐藏态，返回 (action, hidden_out)
+    # 不传则使用 policy 内部维护的隐藏态，仅返回 action，完全兼容原有调用
+    hidden_in: torch.Tensor | None = None,
 ):
     """
     Performs a single-step inference to predict a robot action from an observation.
 
-    This function encapsulates the full inference pipeline:
-    1. Prepares the observation by converting it to PyTorch tensors and adding a batch dimension.
-    2. Runs the preprocessor pipeline on the observation.
-    3. Feeds the processed observation to the policy to get a raw action.
-    4. Runs the postprocessor pipeline on the raw action.
-    5. Formats the final action by removing the batch dimension and moving it to the CPU.
+    [GRU 改造说明]
+    - 默认模式（hidden_in=None）：隐藏态由 policy 内部维护，连续调用自动保持时序连续性。
+      每个 episode 开始前需调用 policy.reset() 初始化隐藏态。
+    - 显式模式（传入 hidden_in）：使用外部传入的隐藏态推理，返回新的隐藏态，
+      适合多环境并行、自定义状态管理等场景。
 
     Args:
         observation: A dictionary of NumPy arrays representing the robot's current observation.
@@ -69,9 +72,11 @@ def predict_action(
         use_amp: A boolean to enable/disable Automatic Mixed Precision for CUDA inference.
         task: An optional string identifier for the task.
         robot_type: An optional string identifier for the robot type.
+        hidden_in: Optional initial GRU hidden state for external state management.
 
     Returns:
-        A `torch.Tensor` containing the predicted action, ready for the robot.
+        Default: torch.Tensor containing the predicted action, ready for the robot.
+        When hidden_in is provided: tuple of (action, hidden_out)
     """
     observation = copy(observation)
     with (
@@ -82,13 +87,21 @@ def predict_action(
         observation = prepare_observation_for_inference(observation, device, task, robot_type)
         observation = preprocessor(observation)
 
-        # Compute the next action with the policy
-        # based on the current observation
-        action = policy.select_action(observation)
-
-        action = postprocessor(action)
-
-    return action
+        # ========== 【GRU 改造核心】隐藏态分支处理 ==========
+        if hidden_in is not None:
+            # 外部管理隐藏态：临时写入 policy，推理后取出新状态，避免污染内部状态
+            original_hidden = policy.actor._hidden_state
+            policy.actor._hidden_state = hidden_in
+            action = policy.select_action(observation)
+            hidden_out = policy.actor._hidden_state
+            policy.actor._hidden_state = original_hidden  # 恢复内部状态
+            action = postprocessor(action)
+            return action, hidden_out
+        else:
+            # 默认模式：使用 policy 内部维护的隐藏态，与原版调用完全一致
+            action = policy.select_action(observation)
+            action = postprocessor(action)
+            return action
 
 
 def sanity_check_dataset_name(repo_id, policy_cfg):

@@ -32,7 +32,9 @@ class DataMixer(abc.ABC):
     def get_iterator(
         self,
         batch_size: int,
-        async_prefetch: bool = True,
+        #关闭异步预取
+        #async_prefetch: bool = True,
+        async_prefetch: bool = False,
         queue_size: int = 2,
     ):
         """Infinite iterator that yields batches."""

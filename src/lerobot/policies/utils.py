@@ -16,6 +16,7 @@
 
 import logging
 from collections import deque
+import traceback
 
 import numpy as np
 import torch
@@ -87,10 +88,12 @@ def log_model_loading_keys(missing_keys: list[str], unexpected_keys: list[str]) 
         missing_keys (list[str]): Keys that were expected but not found.
         unexpected_keys (list[str]): Keys that were found but not expected.
     """
+    logging.info("[DEBUG_LOAD] 调用栈倒数第3层: " + traceback.format_stack()[-3].strip())
     if missing_keys:
         logging.warning(f"Missing key(s) when loading model: {missing_keys}")
     if unexpected_keys:
-        logging.warning(f"Unexpected key(s) when loading model: {unexpected_keys}")
+        logging.warning(f"[FROM policies/utils] Unexpected key(s) when loading model: {unexpected_keys}")
+        #logging.warning(f"Unexpected key(s) when loading model: {unexpected_keys}")
 
 
 # TODO(Steven): Move this function to a proper preprocessor step

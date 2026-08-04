@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from __future__ import annotations
+import logging
 
 import gymnasium as gym
 import mujoco
@@ -57,10 +58,19 @@ class PassiveViewerWrapper(gym.Wrapper):
     # ---------------------------------------------------------------------
     # Gym API overrides
 
-    def reset(self, **kwargs):  # type: ignore[override]
-        observation, info = self.env.reset(**kwargs)
-        self._viewer.sync()
-        return observation, info
+    # def reset(self, **kwargs):  # type: ignore[override]
+    #     observation, info = self.env.reset(**kwargs)
+    #     self._viewer.sync()
+    #     return observation, info
+    def reset(self, **kwargs):
+        for retry in range(3):
+            try:
+                observation, info = self.env.reset(**kwargs)
+                self._viewer.sync()
+                return observation, info
+            except Exception as e:
+                logging.warning(f"环境重置失败，第{retry+1}次重试：{e}")
+        raise RuntimeError("环境重置连续失败")
 
     def step(self, action):  # type: ignore[override]
         observation, reward, terminated, truncated, info = self.env.step(action)

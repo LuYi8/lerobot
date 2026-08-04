@@ -141,7 +141,7 @@ class PreTrainedRewardModel(nn.Module, HubMixin, abc.ABC):
         if missing_keys:
             logging.warning(f"Missing key(s) when loading model: {missing_keys}")
         if unexpected_keys:
-            logging.warning(f"Unexpected key(s) when loading model: {unexpected_keys}")
+            logging.warning(f"[FROM rewards/pretrained] Unexpected key(s) when loading model: {unexpected_keys}")
 
         # For older versions, manually move to device if needed
         if "device" not in kwargs and map_location != "cpu":

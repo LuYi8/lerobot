@@ -252,188 +252,245 @@ def act_with_policy(
         interactions_queue: Queue to send interactions to the learner.
     """
     # Initialize logging for multiprocessing
-    if not use_threads(cfg):
-        log_dir = os.path.join(cfg.output_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"actor_policy_{os.getpid()}.log")
-        init_logging(log_file=log_file, display_pid=True)
-        logging.info("Actor policy process logging initialized")
+    try:  # 【新增】最外层全局异常捕获
+        # ========== 原有函数全部内容完整保留 ==========
+        if not use_threads(cfg):
+            log_dir = os.path.join(cfg.output_dir, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, f"actor_policy_{os.getpid()}.log")
+            init_logging(log_file=log_file, display_pid=True)
+            logging.info("Actor policy process logging initialized")
 
-    logging.info("make_env online")
+        logging.info("make_env online")
 
-    online_env, teleop_device = make_robot_env(cfg=cfg.env)
-    print(f"Environment action space shape: {online_env.action_space.shape}")
-    env_processor, action_processor = make_processors(online_env, teleop_device, cfg.env, cfg.policy.device)
+        online_env, teleop_device = make_robot_env(cfg=cfg.env)
+        print(f"Environment action space shape: {online_env.action_space.shape}")
+        env_processor, action_processor = make_processors(online_env, teleop_device, cfg.env, cfg.policy.device)
 
-    set_seed(cfg.seed)
-    device = get_safe_torch_device(cfg.policy.device, log=True)
+        set_seed(cfg.seed)
+        device = get_safe_torch_device(cfg.policy.device, log=True)
 
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
 
-    logging.info("make_policy")
+        logging.info("make_policy")
 
-    ### Instantiate the policy in both the actor and learner processes
-    ### To avoid sending a policy object through the port, we create a policy instance
-    ### on both sides, the learner sends the updated parameters every n steps to update the actor's parameters
-    policy = make_policy(
-        cfg=cfg.policy,
-        env_cfg=cfg.env,
-    )
-    policy = policy.to(device).eval()
-    assert isinstance(policy, nn.Module)
+        ### Instantiate the policy in both the actor and learner processes
+        ### To avoid sending a policy object through the port, we create a policy instance
+        ### on both sides, the learner sends the updated parameters every n steps to update the actor's parameters
+        policy = make_policy(
+            cfg=cfg.policy,
+            env_cfg=cfg.env,
+        )
+        policy = policy.to(device).eval()
+        assert isinstance(policy, nn.Module)
 
-    # Build the algorithm
-    algorithm = make_algorithm(cfg=cfg.algorithm, policy=policy)
+        # Build the algorithm
+        algorithm = make_algorithm(cfg=cfg.algorithm, policy=policy)
 
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=cfg.policy,
-        dataset_stats=cfg.policy.dataset_stats,
-    )
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=cfg.policy,
+            dataset_stats=cfg.policy.dataset_stats,
+        )
 
-    transition = reset_and_build_transition(online_env, env_processor, action_processor)
-
-    # NOTE: For the moment we will solely handle the case of a single environment
-    sum_reward_episode = 0
-    list_transition_to_send_to_learner = []
-    episode_intervention = False
-    # Add counters for intervention rate calculation
-    episode_intervention_steps = 0
-    episode_total_steps = 0
-
-    policy_timer = TimerManager("Policy inference", log=False)
-
-    for interaction_step in range(cfg.policy.online_steps):
-        start_time = time.perf_counter()
-        if shutdown_event.is_set():
-            logging.info("[ACTOR] Shutting down act_with_policy")
+        # 【修改】环境重置增加3次重试，避免单次失败直接终止
+        reset_success = False
+        for retry in range(3):
+            try:
+                transition = reset_and_build_transition(online_env, env_processor, action_processor)
+                reset_success = True
+                break
+            except Exception as e:
+                logging.warning(f"[ACTOR] 环境重置失败，第{retry+1}次重试：{str(e)}")
+                time.sleep(1.0)
+        
+        if not reset_success:
+            logging.error("[ACTOR] 环境连续3次重置失败，终止交互流程")
+            shutdown_event.set()
             return
+        
+        logging.debug("Reset GRU hidden state at episode start")
+        policy.reset()
 
-        observation = {
-            k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
-        }
+        
+        # NOTE: For the moment we will solely handle the case of a single environment
+        sum_reward_episode = 0
+        list_transition_to_send_to_learner = []
+        episode_intervention = False
+        # Add counters for intervention rate calculation
+        episode_intervention_steps = 0
+        episode_total_steps = 0
 
-        # Time policy inference and check if it meets FPS requirement
-        with policy_timer:
-            normalized_observation = preprocessor.process_observation(observation)
-            action = policy.select_action(batch=normalized_observation)
-            # Unnormalize only the continuous part.
-            if cfg.policy.num_discrete_actions is not None:
-                #修改
-                continuous_action = postprocessor.process_action(action[..., :-1])
-                #continuous_action = postprocessor.process_action(action)
-                #结束
-                discrete_action = action[..., -1:].to(
-                    device=continuous_action.device, dtype=continuous_action.dtype
+        policy_timer = TimerManager("Policy inference", log=False)
+        
+        for interaction_step in range(cfg.policy.online_steps):
+            start_time = time.perf_counter()
+            if shutdown_event.is_set():
+                logging.info("[ACTOR] Shutting down act_with_policy")
+                return
+
+            observation = {
+                k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
+            }
+
+            # Time policy inference and check if it meets FPS requirement
+            # Time policy inference and check if it meets FPS requirement
+            with policy_timer:
+                # ========== 新增：原始观测 NaN 检测 ==========
+                raw_has_nan = any(
+                    torch.isnan(v).any() 
+                    for v in observation.values() 
+                    if isinstance(v, torch.Tensor)
                 )
-                action = torch.cat([continuous_action, discrete_action], dim=-1)
-            else:
-                action = postprocessor.process_action(action)
-        policy_fps = policy_timer.fps_last
+                if raw_has_nan:
+                    logging.warning("[DEBUG] Raw observation from env has NaN!")
 
-        log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
-
-        # Use the new step function
-        new_transition = step_env_and_process_transition(
-            env=online_env,
-            transition=transition,
-            action=action,
-            env_processor=env_processor,
-            action_processor=action_processor,
-        )
-
-        # Extract values from processed transition
-        next_observation = {
-            k: v
-            for k, v in new_transition[TransitionKey.OBSERVATION].items()
-            if k in cfg.policy.input_features
-        }
-
-        # Teleop action is the action that was executed in the environment
-        # It is either the action from the teleop device or the action from the policy
-        executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
-
-        reward = new_transition[TransitionKey.REWARD]
-        done = new_transition.get(TransitionKey.DONE, False)
-        truncated = new_transition.get(TransitionKey.TRUNCATED, False)
-
-        sum_reward_episode += float(reward)
-        episode_total_steps += 1
-
-        # Check for intervention from transition info
-        intervention_info = new_transition[TransitionKey.INFO]
-        is_intervention = bool(intervention_info.get(TeleopEvents.IS_INTERVENTION, False))
-        if is_intervention:
-            episode_intervention = True
-            episode_intervention_steps += 1
-
-        complementary_info = {
-            "discrete_penalty": torch.tensor(
-                [new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
-            ),
-            TeleopEvents.IS_INTERVENTION.value: is_intervention,
-        }
-        # Create transition for learner (convert to old format)
-        list_transition_to_send_to_learner.append(
-            Transition(
-                state=observation,
-                action=executed_action,
-                reward=reward,
-                next_state=next_observation,
-                done=done,
-                truncated=truncated,
-                complementary_info=complementary_info,
-            )
-        )
-
-        # Update transition for next iteration
-        transition = new_transition
-
-        if done or truncated:
-            logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
-
-            update_policy_parameters(algorithm=algorithm, parameters_queue=parameters_queue, device=device)
-
-            if len(list_transition_to_send_to_learner) > 0:
-                push_transitions_to_transport_queue(
-                    transitions=list_transition_to_send_to_learner,
-                    transitions_queue=transitions_queue,
+                normalized_observation = preprocessor.process_observation(observation)
+                # 新增：观测最终兜底，任何异常值都替换为0
+                for k in normalized_observation:
+                    if isinstance(normalized_observation[k], torch.Tensor):
+                        normalized_observation[k] = torch.nan_to_num(
+                            normalized_observation[k], nan=0.0, posinf=1.0, neginf=-1.0
+                        )
+                # ========== 新增：归一化后 NaN 检测 ==========
+                norm_has_nan = any(
+                    torch.isnan(v).any() 
+                    for v in normalized_observation.values() 
+                    if isinstance(v, torch.Tensor)
                 )
-                list_transition_to_send_to_learner = []
+                if norm_has_nan and not raw_has_nan:
+                    logging.warning("[DEBUG] NaN introduced by observation normalizer!")
 
-            stats = get_frequency_stats(policy_timer)
-            policy_timer.reset()
+                # 每步都正常推理，保证动作永远有效
+                # GRU隐藏态会跟随真实观测自动更新，干预期间也保持连续
+                action = policy.select_action(batch=normalized_observation)
 
-            # Calculate intervention rate
-            intervention_rate = 0.0
-            if episode_total_steps > 0:
-                intervention_rate = episode_intervention_steps / episode_total_steps
+                # Unnormalize only the continuous part.
+                if cfg.policy.num_discrete_actions is not None:
+                    #修改
+                    continuous_action = postprocessor.process_action(action[..., :-1])
+                    #continuous_action = postprocessor.process_action(action)
+                    #结束
+                    discrete_action = action[..., -1:].to(
+                        device=continuous_action.device, dtype=continuous_action.dtype
+                    )
+                    action = torch.cat([continuous_action, discrete_action], dim=-1)
+                else:
+                    action = postprocessor.process_action(action)
+            policy_fps = policy_timer.fps_last
 
-            # Send episodic reward to the learner
-            interactions_queue.put(
-                python_object_to_bytes(
-                    {
-                        "Episodic reward": sum_reward_episode,
-                        "Interaction step": interaction_step,
-                        "Episode intervention": int(episode_intervention),
-                        "Intervention rate": intervention_rate,
-                        **stats,
-                    }
-                )
+            log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
+
+            # Use the new step function
+            new_transition = step_env_and_process_transition(
+                env=online_env,
+                transition=transition,
+                action=action,
+                env_processor=env_processor,
+                action_processor=action_processor,
             )
 
-            # Reset intervention counters and environment
-            sum_reward_episode = 0.0
-            episode_intervention = False
-            episode_intervention_steps = 0
-            episode_total_steps = 0
+            # Extract values from processed transition
+            next_observation = {
+                k: v
+                for k, v in new_transition[TransitionKey.OBSERVATION].items()
+                if k in cfg.policy.input_features
+            }
 
-            transition = reset_and_build_transition(online_env, env_processor, action_processor)
+            # Teleop action is the action that was executed in the environment
+            # It is either the action from the teleop device or the action from the policy
+            executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
 
-        if cfg.env.fps is not None:
-            dt_time = time.perf_counter() - start_time
-            precise_sleep(max(1 / cfg.env.fps - dt_time, 0.0))
+            reward = new_transition[TransitionKey.REWARD]
+            done = new_transition.get(TransitionKey.DONE, False)
+            truncated = new_transition.get(TransitionKey.TRUNCATED, False)
 
+            sum_reward_episode += float(reward)
+            episode_total_steps += 1
+
+            # Check for intervention from transition info
+            intervention_info = new_transition[TransitionKey.INFO]
+            is_intervention = bool(intervention_info.get(TeleopEvents.IS_INTERVENTION, False))
+            if is_intervention:
+                episode_intervention = True
+                episode_intervention_steps += 1
+
+
+
+            complementary_info = {
+                "discrete_penalty": torch.tensor(
+                    [new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
+                ),
+                TeleopEvents.IS_INTERVENTION.value: is_intervention,
+            }
+            # Create transition for learner (convert to old format)
+            list_transition_to_send_to_learner.append(
+                Transition(
+                    state=observation,
+                    action=executed_action,
+                    reward=reward,
+                    next_state=next_observation,
+                    done=done,
+                    truncated=truncated,
+                    complementary_info=complementary_info,
+                )
+            )
+            # Update transition for next iteration
+            transition = new_transition
+
+            if done or truncated:
+                logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
+
+                update_policy_parameters(algorithm=algorithm, parameters_queue=parameters_queue, device=device)
+
+                if len(list_transition_to_send_to_learner) > 0:
+                    push_transitions_to_transport_queue(
+                        transitions=list_transition_to_send_to_learner,
+                        transitions_queue=transitions_queue,
+                    )
+                    list_transition_to_send_to_learner = []
+
+                stats = get_frequency_stats(policy_timer)
+                policy_timer.reset()
+
+                # Calculate intervention rate
+                intervention_rate = 0.0
+                if episode_total_steps > 0:
+                    intervention_rate = episode_intervention_steps / episode_total_steps
+
+                # Send episodic reward to the learner
+                interactions_queue.put(
+                    python_object_to_bytes(
+                        {
+                            "Episodic reward": sum_reward_episode,
+                            "Interaction step": interaction_step,
+                            "Episode intervention": int(episode_intervention),
+                            "Intervention rate": intervention_rate,
+                            **stats,
+                        }
+                    )
+                )
+
+                # Reset intervention counters and environment
+                sum_reward_episode = 0.0
+                episode_intervention = False
+                episode_intervention_steps = 0
+                episode_total_steps = 0
+
+                transition = reset_and_build_transition(online_env, env_processor, action_processor)
+                # ========== 【GRU 改造】首个 episode 初始化隐藏态 ==========
+                # use_gru=False 时该方法为空操作，完全兼容原有单步模式
+                logging.debug("Reset GRU hidden state at episode start")
+                policy.reset()
+
+
+            if cfg.env.fps is not None:
+                dt_time = time.perf_counter() - start_time
+                precise_sleep(max(1 / cfg.env.fps - dt_time, 0.0))
+    except Exception as e:
+        logging.critical("[ACTOR] 主交互循环异常崩溃", exc_info=True)
+        shutdown_event.set()
+        raise  # 重新抛出异常，触发后续正常退出清理流程
 
 #  Communication Functions - Group all gRPC/messaging functions
 
@@ -507,42 +564,48 @@ def receive_policy(
         learner_client (services_pb2_grpc.LearnerServiceStub | None): Optional pre-created stub.
         grpc_channel (grpc.Channel | None): Optional pre-created channel.
     """
-    logging.info("[ACTOR] Start receiving parameters from the Learner")
-    if not use_threads(cfg):
-        # Create a process-specific log file
-        log_dir = os.path.join(cfg.output_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"actor_receive_policy_{os.getpid()}.log")
+    try:  # 【新增】函数级全局异常捕获
+        # ========== 原有全部内容完整保留 ==========
+        logging.info("[ACTOR] Start receiving parameters from the Learner")
+        if not use_threads(cfg):
+            # Create a process-specific log file
+            log_dir = os.path.join(cfg.output_dir, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, f"actor_receive_policy_{os.getpid()}.log")
 
-        # Initialize logging with explicit log file
-        init_logging(log_file=log_file, display_pid=True)
-        logging.info("Actor receive policy process logging initialized")
+            # Initialize logging with explicit log file
+            init_logging(log_file=log_file, display_pid=True)
+            logging.info("Actor receive policy process logging initialized")
 
-        # Setup process handlers to handle shutdown signal
-        # But use shutdown event from the main process
-        _ = ProcessSignalHandler(use_threads=False, display_pid=True)
+            # Setup process handlers to handle shutdown signal
+            # But use shutdown event from the main process
+            _ = ProcessSignalHandler(use_threads=False, display_pid=True)
 
-    if grpc_channel is None or learner_client is None:
-        learner_client, grpc_channel = learner_service_client(
-            host=cfg.policy.actor_learner_config.learner_host,
-            port=cfg.policy.actor_learner_config.learner_port,
-        )
+        if grpc_channel is None or learner_client is None:
+            learner_client, grpc_channel = learner_service_client(
+                host=cfg.policy.actor_learner_config.learner_host,
+                port=cfg.policy.actor_learner_config.learner_port,
+            )
 
-    try:
-        iterator = learner_client.StreamParameters(services_pb2.Empty())
-        receive_bytes_in_chunks(
-            iterator,
-            parameters_queue,
-            shutdown_event,
-            log_prefix="[ACTOR] parameters",
-        )
+        try:
+            iterator = learner_client.StreamParameters(services_pb2.Empty())
+            receive_bytes_in_chunks(
+                iterator,
+                parameters_queue,
+                shutdown_event,
+                log_prefix="[ACTOR] parameters",
+            )
 
-    except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
+        except grpc.RpcError as e:
+            logging.error(f"[ACTOR] gRPC error: {e}")
 
-    if not use_threads(cfg):
-        grpc_channel.close()
-    logging.info("[ACTOR] Received policy loop stopped")
+        if not use_threads(cfg):
+            grpc_channel.close()
+        logging.info("[ACTOR] Received policy loop stopped")
+    except Exception as e:
+        logging.critical("[ACTOR] 转移数据发送进程异常崩溃", exc_info=True)
+        raise
+    
 
 
 def send_transitions(
@@ -568,37 +631,41 @@ def send_transitions(
         learner_client (services_pb2_grpc.LearnerServiceStub | None): Optional pre-created stub.
         grpc_channel (grpc.Channel | None): Optional pre-created channel.
     """
+    try:  # 【新增】函数级全局异常捕获
+        # ========== 原有全部内容完整保留 ==========
+        if not use_threads(cfg):
+            # Create a process-specific log file
+            log_dir = os.path.join(cfg.output_dir, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, f"actor_transitions_{os.getpid()}.log")
 
-    if not use_threads(cfg):
-        # Create a process-specific log file
-        log_dir = os.path.join(cfg.output_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"actor_transitions_{os.getpid()}.log")
+            # Initialize logging with explicit log file
+            init_logging(log_file=log_file, display_pid=True)
+            logging.info("Actor transitions process logging initialized")
 
-        # Initialize logging with explicit log file
-        init_logging(log_file=log_file, display_pid=True)
-        logging.info("Actor transitions process logging initialized")
-
-    if grpc_channel is None or learner_client is None:
-        learner_client, grpc_channel = learner_service_client(
-            host=cfg.policy.actor_learner_config.learner_host,
-            port=cfg.policy.actor_learner_config.learner_port,
-        )
-
-    try:
-        learner_client.SendTransitions(
-            transitions_stream(
-                shutdown_event, transitions_queue, cfg.policy.actor_learner_config.queue_get_timeout
+        if grpc_channel is None or learner_client is None:
+            learner_client, grpc_channel = learner_service_client(
+                host=cfg.policy.actor_learner_config.learner_host,
+                port=cfg.policy.actor_learner_config.learner_port,
             )
-        )
-    except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
 
-    logging.info("[ACTOR] Finished streaming transitions")
+        try:
+            learner_client.SendTransitions(
+                transitions_stream(
+                    shutdown_event, transitions_queue, cfg.policy.actor_learner_config.queue_get_timeout
+                )
+            )
+        except grpc.RpcError as e:
+            logging.error(f"[ACTOR] gRPC error: {e}")
 
-    if not use_threads(cfg):
-        grpc_channel.close()
-    logging.info("[ACTOR] Transitions process stopped")
+        logging.info("[ACTOR] Finished streaming transitions")
+
+        if not use_threads(cfg):
+            grpc_channel.close()
+        logging.info("[ACTOR] Transitions process stopped")
+    except Exception as e:
+        logging.critical("[ACTOR] 转移数据发送进程异常崩溃", exc_info=True)
+        raise
 
 
 def send_interactions(
@@ -624,40 +691,45 @@ def send_interactions(
         grpc_channel (grpc.Channel | None): Optional pre-created channel.
     """
 
-    if not use_threads(cfg):
-        # Create a process-specific log file
-        log_dir = os.path.join(cfg.output_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"actor_interactions_{os.getpid()}.log")
+    try:  # 【新增】函数级全局异常捕获
+        # ========== 原有全部内容完整保留 ==========
+        if not use_threads(cfg):
+            # Create a process-specific log file
+            log_dir = os.path.join(cfg.output_dir, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, f"actor_interactions_{os.getpid()}.log")
 
-        # Initialize logging with explicit log file
-        init_logging(log_file=log_file, display_pid=True)
-        logging.info("Actor interactions process logging initialized")
+            # Initialize logging with explicit log file
+            init_logging(log_file=log_file, display_pid=True)
+            logging.info("Actor interactions process logging initialized")
 
-        # Setup process handlers to handle shutdown signal
-        # But use shutdown event from the main process
-        _ = ProcessSignalHandler(use_threads=False, display_pid=True)
+            # Setup process handlers to handle shutdown signal
+            # But use shutdown event from the main process
+            _ = ProcessSignalHandler(use_threads=False, display_pid=True)
 
-    if grpc_channel is None or learner_client is None:
-        learner_client, grpc_channel = learner_service_client(
-            host=cfg.policy.actor_learner_config.learner_host,
-            port=cfg.policy.actor_learner_config.learner_port,
-        )
-
-    try:
-        learner_client.SendInteractions(
-            interactions_stream(
-                shutdown_event, interactions_queue, cfg.policy.actor_learner_config.queue_get_timeout
+        if grpc_channel is None or learner_client is None:
+            learner_client, grpc_channel = learner_service_client(
+                host=cfg.policy.actor_learner_config.learner_host,
+                port=cfg.policy.actor_learner_config.learner_port,
             )
-        )
-    except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
 
-    logging.info("[ACTOR] Finished streaming interactions")
+        try:
+            learner_client.SendInteractions(
+                interactions_stream(
+                    shutdown_event, interactions_queue, cfg.policy.actor_learner_config.queue_get_timeout
+                )
+            )
+        except grpc.RpcError as e:
+            logging.error(f"[ACTOR] gRPC error: {e}")
 
-    if not use_threads(cfg):
-        grpc_channel.close()
-    logging.info("[ACTOR] Interactions process stopped")
+        logging.info("[ACTOR] Finished streaming interactions")
+
+        if not use_threads(cfg):
+            grpc_channel.close()
+        logging.info("[ACTOR] Interactions process stopped")
+    except Exception as e:
+        logging.critical("[ACTOR] 转移数据发送进程异常崩溃", exc_info=True)
+        raise
 
 
 def transitions_stream(
@@ -709,7 +781,6 @@ def update_policy_parameters(algorithm: RLAlgorithm, parameters_queue: Queue, de
     if bytes_state_dict is not None:
         logging.info("[ACTOR] Load new parameters from Learner.")
         state_dicts = bytes_to_state_dict(bytes_state_dict)
-
         # TODO: check encoder parameter synchronization possible issues:
         # 1. When shared_encoder=True, we're loading stale encoder params from actor's state_dict
         #    instead of the updated encoder params from critic (which is optimized separately)
@@ -720,6 +791,15 @@ def update_policy_parameters(algorithm: RLAlgorithm, parameters_queue: Queue, de
         # - Skip encoder params entirely when freeze_vision_encoder=True
         # - Ensure discrete_critic gets correct encoder state (currently uses encoder_critic)
         algorithm.load_weights(state_dicts, device=device)
+
+        # ========== 新增：权重NaN检测 ==========
+        has_nan = False
+        for name, param in algorithm.policy.named_parameters():
+            if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                logging.error(f"[CRITICAL] NaN/Inf found in parameter: {name}, shape: {param.shape}")
+                has_nan = True
+        if has_nan:
+            logging.error("[CRITICAL] Loaded weights from learner contain NaN! Policy will be unstable.")
 
 
 #  Utilities functions
