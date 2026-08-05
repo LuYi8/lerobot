@@ -24,6 +24,88 @@ from ..utils import get_device_from_parameters, get_dtype_from_parameters
 from .configuration_gaussian_actor import GaussianActorConfig, is_image_feature
 from torch.distributions import Normal, Independent
 DISCRETE_DIMENSION_INDEX = -1  # Gripper is always the last dimension
+import math
+from typing import Optional
+
+class NanInfTracker:
+    """分层 NaN/Inf 异常追踪器
+    支持按模块统计异常数量与占比，超过阈值触发告警，避免过度兜底掩盖问题
+    """
+    def __init__(
+        self,
+        warn_threshold: int = 1,          # 单步异常数≥该值触发告警
+        warn_ratio: float = 0.0,         # 异常占比≥该值触发告警（0表示不按占比触发）
+        summary_steps: int = 100,        # 每N步打印一次汇总统计
+        module_name: str = "module",
+        enable: bool = True,
+    ):
+        self.module_name = module_name
+        self.warn_threshold = warn_threshold
+        self.warn_ratio = warn_ratio
+        self.summary_steps = summary_steps
+        self.enable = enable
+
+        # 累积统计
+        self.step_count = 0
+        self.total_nan = 0
+        self.total_inf = 0
+        self.abnormal_steps = 0  # 出现过异常的步数
+
+    def track(self, tensor: Tensor, desc: str = "") -> tuple[int, int]:
+        """统计张量中的 NaN 和 Inf 数量，触发阈值则告警
+        返回: (nan_count, inf_count)
+        """
+        if not self.enable or tensor is None:
+            return 0, 0
+
+        nan_count = int(torch.isnan(tensor).sum().item())
+        inf_count = int(torch.isinf(tensor).sum().item())
+        total_elem = tensor.numel()
+
+        if nan_count > 0 or inf_count > 0:
+            self.total_nan += nan_count
+            self.total_inf += inf_count
+            self.abnormal_steps += 1
+
+            # 单步阈值告警
+            total_abnormal = nan_count + inf_count
+            ratio = total_abnormal / total_elem if total_elem > 0 else 0.0
+            hit_threshold = total_abnormal >= self.warn_threshold
+            hit_ratio = self.warn_ratio > 0 and ratio >= self.warn_ratio
+
+            if hit_threshold or hit_ratio:
+                print(
+                    f"[WARNING][{self.module_name}] {desc} | "
+                    f"NaN={nan_count}, Inf={inf_count}, "
+                    f"占比={ratio:.4%}, 张量shape={list(tensor.shape)}"
+                )
+
+        self.step_count += 1
+
+        # 周期性汇总
+        if self.summary_steps > 0 and self.step_count % self.summary_steps == 0:
+            self._print_summary()
+
+        return nan_count, inf_count
+
+    def _print_summary(self):
+        if self.abnormal_steps == 0:
+            return
+        print(
+            f"[SUMMARY][{self.module_name}] 近{self.summary_steps}步汇总 | "
+            f"异常步数={self.abnormal_steps}, 累计NaN={self.total_nan}, "
+            f"累计Inf={self.total_inf}"
+        )
+        # 重置周期统计
+        self.total_nan = 0
+        self.total_inf = 0
+        self.abnormal_steps = 0
+
+    def reset(self):
+        self.step_count = 0
+        self.total_nan = 0
+        self.total_inf = 0
+        self.abnormal_steps = 0
 
 
 class GaussianActorPolicy(
@@ -77,19 +159,25 @@ class GaussianActorPolicy(
         Maintains internal GRU hidden state across timesteps. Call reset() at episode start.
         接口签名与原版完全一致，GRU模式下内部自动维护隐藏态
         """
+        # ===== 初始化观测异常追踪器（首次调用创建）=====
+        if not hasattr(self, "_obs_tracker"):
+            self._obs_tracker = NanInfTracker(
+                module_name="ObsInput",
+                warn_threshold=1,
+                summary_steps=500,  # 推理侧步数多，降低汇总频率
+            )
         # print("=== 观测输入校验 ===")
         # for k, v in batch.items():
         #     if isinstance(v, torch.Tensor):
         #         print(f"{k}: shape={list(v.shape)}, min={v.min():.4f}, max={v.max():.4f}, mean={v.mean():.4f}")
                 # ===== 新增：观测NaN清洗 =====
+        # ===== 新增：先统计异常，再兜底 =====
         for key in batch:
-            if torch.isnan(batch[key]).any():
-                # 打印异常维度信息，方便后续定位
-                nan_mask = torch.isnan(batch[key])
-                print(f"[WARNING] NaN detected in obs key: {key}, count: {nan_mask.sum().item()}")
-                # 用0填充NaN，避免后续计算全崩
+            if isinstance(batch[key], torch.Tensor) and torch.isnan(batch[key]).any():
+                self._obs_tracker.track(batch[key], desc=f"key={key}")
+                # 原有兜底逻辑保留
                 batch[key] = torch.nan_to_num(batch[key], nan=0.0, posinf=1e3, neginf=-1e3)
-        # ==========================
+        # ==========================================
         observations_features = None
         if self.shared_encoder and self.actor.encoder.has_images:
             observations_features = self.actor.encoder.get_cached_image_features(batch)
@@ -193,6 +281,13 @@ class GaussianActorObservationEncoder(nn.Module):
         self._init_image_layers()
         self._init_state_layers()
         self._compute_output_dim()
+        # ===== 新增：编码器输出异常追踪器 =====
+        self.output_tracker = NanInfTracker(
+            module_name="Encoder",
+            warn_threshold=1,
+            warn_ratio=0.01,  # 异常元素占比超1%告警
+            summary_steps=100,
+        )
 
     def _init_image_layers(self) -> None:
         self.image_keys = [k for k in self.config.input_features if is_image_feature(k)]
@@ -300,10 +395,13 @@ class GaussianActorObservationEncoder(nn.Module):
             out = torch.cat(parts, dim=-1)
         else:
             raise ValueError("No parts to concatenate")
-        # ========== 新增：编码器输出数值兜底，训练/推理全链路生效 ==========
+        # ===== 新增：先统计异常，再执行兜底 =====
+        self.output_tracker.track(out, desc="encoder_concat_output")
+        
+        # 原有兜底逻辑保留
         out = torch.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0)
         out = torch.clamp(out, -50.0, 50.0)
-        # ================================================================
+        # ======================================
         #print(f"[编码器调试] 最终拼接输出 | min={out.min():.4f} max={out.max():.4f} mean={out.mean():.4f}")
         
         # 恢复序列维度
@@ -478,8 +576,9 @@ class Policy(nn.Module):
         encoder: GaussianActorObservationEncoder,
         mlp_kwargs: dict,  # MLP构造参数，替代原network参数
         action_dim: int,
-        std_min: float = -5,
-        std_max: float = 2,
+        std_min: float = 1e-6,
+        std_max: float = 10.0,
+
         fixed_std: torch.Tensor | None = None,
         init_final: float | None = None,
         use_tanh_squash: bool = False,
@@ -548,6 +647,13 @@ class Policy(nn.Module):
                 nn.init.uniform_(self.std_layer.bias, -init_final, init_final)
             else:
                 orthogonal_init()(self.std_layer.weight)
+        # ===== 新增：分层异常追踪器 =====
+        self.enc_out_tracker = NanInfTracker(module_name="Policy-EncOut", warn_threshold=1, summary_steps=100)
+        self.gru_in_tracker = NanInfTracker(module_name="Policy-GRUIn", warn_threshold=1, summary_steps=100)
+        self.gru_out_tracker = NanInfTracker(module_name="Policy-GRUOut", warn_threshold=1, summary_steps=100)
+        self.hidden_tracker = NanInfTracker(module_name="Policy-Hidden", warn_threshold=1, summary_steps=100)
+        self.action_head_tracker = NanInfTracker(module_name="Policy-ActionHead", warn_threshold=1, summary_steps=100)
+
 
     def reset_hidden(self, batch_size: int = 1):
         """Reset GRU hidden state to zero. Called at episode start for inference.
@@ -567,79 +673,93 @@ class Policy(nn.Module):
         self,
         observations: torch.Tensor,
         observation_features: torch.Tensor | None = None,
-        mode: str = "train",  # "train" | "inference"
-        hidden_in: torch.Tensor | None = None,  # 训练模式可选初始隐藏态
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mode: str = "train",
+        hidden_in: torch.Tensor | None = None,
+        return_hidden: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # 编码器前向：共享编码器时detach梯度
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
         # 编码器输出数值兜底：过滤NaN/Inf，限制范围
+        # ===== 新增：编码器输出异常统计 =====
+        self.enc_out_tracker.track(obs_enc, desc=f"mode={mode}")
         obs_enc = torch.nan_to_num(obs_enc, nan=0.0, posinf=10.0, neginf=-10.0)
-        obs_enc = torch.clamp(obs_enc, -100.0, 100.0)
+
         #print(f"[逐层调试] 编码器输出 | min={obs_enc.min():.4f} max={obs_enc.max():.4f} mean={obs_enc.mean():.4f}")
         # GRU时序处理分支
         if self.use_gru:
             if mode == "train":
-                # 训练模式：输入完整序列 [B, L, D]
                 if not hasattr(self, '_flattened'):
                     self.gru.flatten_parameters()
                     setattr(self, '_flattened', True)
-                # 未传入初始隐藏态则零初始化
                 init_hidden = hidden_in if hidden_in is not None else None
-                gru_out, _ = self.gru(obs_enc, init_hidden)  # [B, L, H]
+                # 训练模式：GRU输入统计
+                self.gru_in_tracker.track(obs_enc, desc="train_input")
+                gru_out, hidden_out = self.gru(obs_enc, init_hidden)
+                
+                # 训练模式：GRU输出与隐藏态统计
+                self.gru_out_tracker.track(gru_out, desc="train_output")
+                self.hidden_tracker.track(hidden_out, desc="train_hidden")
                 net_in = gru_out
             elif mode == "inference":
                 # 隐藏态异常时自动重置
-                if self._hidden_state is not None and (torch.isnan(self._hidden_state).any() or torch.isinf(self._hidden_state).any()):
-                    print("[WARNING] GRU hidden state has NaN/Inf, resetting...")
-                    self.reset_hidden(batch_size=obs_enc.shape[0])
+                # 隐藏态异常检测保留并增强
+                if self._hidden_state is not None:
+                    self.hidden_tracker.track(self._hidden_state, desc="inference_hidden_before")
+                    if torch.isnan(self._hidden_state).any() or torch.isinf(self._hidden_state).any():
+                        print("[WARNING] GRU hidden state has NaN/Inf, resetting...")
+                        self.reset_hidden(batch_size=obs_enc.shape[0])
 
-                if self._hidden_state is None:
-                    batch_size = obs_enc.shape[0]
-                    self.reset_hidden(batch_size=batch_size)
                 # 新增：打印隐藏态与输入特征的范数，判断是否坍缩
                 #print(f"[GRU调试] 输入特征范数: {obs_enc.norm().item():.4f}")
                 #print(f"[GRU调试] 隐藏态范数: {self._hidden_state.norm().item():.4f}")
-                # ========== 新增：GRU 输入强裁剪，从源头抑制数值爆炸 ==========
-                obs_enc = torch.clamp(obs_enc, -10.0, 10.0)
+                # ========== 新增：GRU 输入统计 ==========
+                self.gru_in_tracker.track(obs_enc, desc="inference_input")
                 # ============================================================
                 obs_enc = obs_enc.unsqueeze(1)  # [B, 1, D]
                 gru_out, new_hidden = self.gru(obs_enc, self._hidden_state)
                 # 新增：打印GRU输出范数
                 #print(f"[GRU调试] GRU输出范数: {gru_out.norm().item():.4f}")
-                # 新增：强制裁剪隐藏态与输出，彻底杜绝数值爆炸
-                new_hidden = torch.clamp(new_hidden, -50.0, 50.0)
-                gru_out = torch.clamp(gru_out, -50.0, 50.0)
+                # GRU 输出与新隐藏态统计
+                self.gru_out_tracker.track(gru_out, desc="inference_output")
+                self.hidden_tracker.track(new_hidden, desc="inference_hidden_after")
                 # ========== 新增：NaN/Inf 二次校验，异常则用零替换 ==========
                 new_hidden = torch.nan_to_num(new_hidden, nan=0.0, posinf=20.0, neginf=-20.0)
                 gru_out = torch.nan_to_num(gru_out, nan=0.0, posinf=20.0, neginf=-20.0)
                 # ============================================================
                 self._hidden_state = new_hidden
                 net_in = gru_out.squeeze(1)  # [B, H]
+                hidden_out = new_hidden
             else:
                 raise ValueError(f"Invalid mode: {mode}. Must be 'train' or 'inference'.")
             #print(f"[调试] GRU输出 | min={gru_out.min():.4f} max={gru_out.max():.4f} mean={gru_out.mean():.4f}")
         else:
             net_in = obs_enc
+            hidden_out = None
 
         # MLP + 高斯分布头
         outputs = self.network(net_in)
         #print(f"[调试] MLP输出 | min={outputs.min():.4f} max={outputs.max():.4f} mean={outputs.mean():.4f}")
         # 新增：MLP输出数值裁剪
-        outputs = torch.clamp(outputs, -100.0, 100.0)
+        # 新增：MLP输出异常统计
+        self.action_head_tracker.track(outputs, desc="mlp_output")
         
         means = self.mean_layer(outputs)
         #print(f"[调试] 动作均值 | min={means.min():.4f} max={means.max():.4f} mean={means.mean():.4f}")
         # 均值裁剪到合理动作范围，避免输出极端动作导致环境发散
-        means = torch.clamp(means, -5.0, 5.0)
+        self.action_head_tracker.track(means, desc="action_mean")
 
         # 计算标准差
         if self.fixed_std is None:
             log_std = self.std_layer(outputs)
-            # 先在对数空间做 clamp，保证 exp 后标准差严格为正，对齐参数原本的语义
-            log_std = torch.clamp(log_std, self.std_min, self.std_max)
+            self.action_head_tracker.track(log_std, desc="log_std")
             std = torch.exp(log_std)
-            # 双重保险：强制加极小下限，彻底避免极端数值下溢
-            std = torch.clamp_min(std, 1e-6)
+            # 在原始空间做范围限制，与配置参数语义完全对齐
+            std = torch.clamp(std, self.std_min, self.std_max)
+            # ========== 新增：单独限制夹爪维度的标准差上限 ==========
+            # 夹爪为第4维（索引3），降低其探索噪声，抑制随机开合
+            GRIPPER_DIM_IDX = 3
+            MAX_GRIPPER_STD = 0.1  # 归一化空间下的最大标准差，越小越稳定
+            std[..., GRIPPER_DIM_IDX] = torch.clamp(std[..., GRIPPER_DIM_IDX], max=MAX_GRIPPER_STD)
         else:
             std = self.fixed_std.expand_as(means)
 
@@ -648,6 +768,8 @@ class Policy(nn.Module):
         actions = dist.rsample()  # 重参数化采样
         log_probs = dist.log_prob(actions)
 
+        if return_hidden:
+            return actions, log_probs, means, hidden_out
         return actions, log_probs, means
 
     def get_features(self, observations: torch.Tensor) -> torch.Tensor:
@@ -824,6 +946,18 @@ class RescaleFromTanh(Transform):
 
 class TanhMultivariateNormalDiag(TransformedDistribution):
     def __init__(self, loc, scale_diag, low=None, high=None):
+        # ===== 新增：分布输入异常统计 =====
+        # 首次调用创建追踪器实例（类级别共享）
+        if not hasattr(TanhMultivariateNormalDiag, "_tracker"):
+            TanhMultivariateNormalDiag._tracker = NanInfTracker(
+                module_name="TanhNormalDist",
+                warn_threshold=1,
+                warn_ratio=0.005,
+                summary_steps=200,
+            )
+        TanhMultivariateNormalDiag._tracker.track(loc, desc="loc_input")
+        TanhMultivariateNormalDiag._tracker.track(scale_diag, desc="scale_input")
+        # =================================
         # 数值兜底：过滤NaN/Inf，保证标准差严格为正
         loc = torch.nan_to_num(loc, nan=0.0, posinf=1.0, neginf=-1.0)
         scale_diag = torch.nan_to_num(scale_diag, nan=1e-2, posinf=1.0, neginf=1e-2)

@@ -35,7 +35,8 @@ class BatchTransition(TypedDict):
     done: torch.Tensor
     truncated: torch.Tensor
     complementary_info: dict[str, torch.Tensor | float | int] | None = None
-
+    # 新增：序列初始隐藏态，仅在 store_hidden_states=True 时存在
+    initial_hidden: torch.Tensor | None = None
 
 def random_crop_vectorized(images: torch.Tensor, output_size: tuple) -> torch.Tensor:
     """
@@ -82,6 +83,10 @@ class ReplayBuffer:
         # ========== 【新增】序列采样核心参数 ==========
         use_sequence: bool = False,
         seq_len: int | None = None,
+         # ========== 新增：隐藏态存储配置 ==========
+        store_hidden_states: bool = False,
+        # GRU隐藏态形状：(num_gru_layers, gru_hidden_size)
+        hidden_shape: tuple[int, int] | None = None,
     ):
         """
         Replay buffer for storing transitions.
@@ -136,6 +141,14 @@ class ReplayBuffer:
             self._current_episode_start = 0
             # 环形覆盖警告标记（只警告一次）
             self._seq_cover_warned = False
+        # ========== 新增：隐藏态初始化 ==========
+        self.store_hidden_states = store_hidden_states
+        self.hidden_shape = hidden_shape
+        if self.store_hidden_states:
+            if self.hidden_shape is None or len(self.hidden_shape) != 2:
+                raise ValueError(
+                    "hidden_shape must be (num_layers, hidden_size) when store_hidden_states=True"
+                )
 
     def _initialize_storage(
         self,
@@ -190,6 +203,15 @@ class ReplayBuffer:
                     raise ValueError(f"Unsupported type {type(value)} for complementary_info[{key}]")
 
         self.initialized = True
+        # ========== 新增：初始化隐藏态存储张量 ==========
+        if self.store_hidden_states:
+            num_layers, hidden_size = self.hidden_shape
+            # 存储格式：[capacity, num_layers, hidden_size]
+            # 推理时batch=1，存储时去掉batch维度节省空间
+            self.hidden_states = torch.empty(
+                (self.capacity, num_layers, hidden_size),
+                device=self.storage_device,
+            )
 
     def __len__(self):
         return self.size
@@ -203,6 +225,8 @@ class ReplayBuffer:
         done: bool,
         truncated: bool,
         complementary_info: dict[str, torch.Tensor] | None = None,
+        # 新增：当前步的输入隐藏态（执行该步动作前的隐藏态）
+        hidden_state: torch.Tensor | None = None,
     ):
         """Saves a transition, ensuring tensors are stored on the designated storage device."""
         with self._lock:
@@ -231,6 +255,19 @@ class ReplayBuffer:
                         elif isinstance(value, (int | float)):
                             self.complementary_info[key][self.position] = value
 
+            # ========== 新增：存储当前步隐藏态 ==========
+            if self.store_hidden_states:
+                if hidden_state is None:
+                    raise ValueError(
+                        "store_hidden_states=True but no hidden_state provided in add()"
+                    )
+                # 统一去掉batch维度：从 [num_layers, 1, hidden_size] -> [num_layers, hidden_size]
+                if hidden_state.ndim == 3:
+                    hidden_state = hidden_state.squeeze(1)
+                # 移到存储设备后写入
+                self.hidden_states[self.position].copy_(
+                    hidden_state.to(self.storage_device)
+                )
             # ========== 【修改后】序列模式：更新episode边界 ==========
             if self.use_sequence:
                 if done or truncated:
@@ -370,7 +407,21 @@ class ReplayBuffer:
 
             # 堆叠为 [batch_size, seq_len] 索引张量
             idx = torch.stack(seq_idx_list, dim=0)  # shape: (B, L)
+            # ========== 新增：提取每个序列的初始隐藏态 ==========
+            batch_initial_hidden = None
+            batch_next_initial_hidden = None
+            if self.store_hidden_states:
+                # 1. state序列初始隐藏态：序列第0步的输入隐藏态
+                # 形状 [batch_size, num_layers, hidden_size]
+                batch_initial_hidden = self.hidden_states[idx[:, 0]].to(self.device)
+                # 转换为GRU标准输入格式：[num_layers, batch_size, hidden_size]
+                batch_initial_hidden = batch_initial_hidden.permute(1, 0, 2).contiguous()
 
+                # 2. next_state序列初始隐藏态：序列第1步的输入隐藏态（错位1步）
+                # 环形buffer取模防止越界，与next_state的索引逻辑对齐
+                next_start_idx = (idx[:, 0] + 1) % self.capacity
+                batch_next_initial_hidden = self.hidden_states[next_start_idx].to(self.device)
+                batch_next_initial_hidden = batch_next_initial_hidden.permute(1, 0, 2).contiguous()
             # 4. 提取所有特征张量
             batch_state = {}
             batch_next_state = {}
@@ -428,6 +479,9 @@ class ReplayBuffer:
             done=batch_dones,
             truncated=batch_truncateds,
             complementary_info=batch_complementary_info,
+            # 新增：返回初始隐藏态
+            initial_hidden=batch_initial_hidden,
+            next_initial_hidden=batch_next_initial_hidden,  # 新增
         )
 
     def get_iterator(

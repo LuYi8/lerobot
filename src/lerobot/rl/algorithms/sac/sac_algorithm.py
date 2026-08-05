@@ -165,15 +165,15 @@ class SACAlgorithm(RLAlgorithm):
         actions: Tensor,
         use_target: bool = False,
         observation_features: Tensor | None = None,
-    ) -> Tensor:
-        """Forward pass through a critic network ensemble
-        兼容单步/序列两种输入模式：
-        - 单步: 输出 shape [num_critics, batch_size]
-        - 序列: 输出 shape [num_critics, batch_size, seq_len]
-        """
+        hidden_in: Tensor | None = None,
+        return_hidden: bool = False,
+    ) -> Tensor | tuple[Tensor, list[Tensor]]:
         critics = self.critic_target if use_target else self.critic_ensemble
-        q_values = critics(observations, actions, observation_features)
-        return q_values
+        return critics(
+            observations, actions, observation_features,
+            hidden_in=hidden_in, return_hidden=return_hidden
+        )
+
 
     def _discrete_critic_forward(
         self, observations, use_target=False, observation_features=None
@@ -277,83 +277,133 @@ class SACAlgorithm(RLAlgorithm):
         # =============================================
         self._optimization_step += 1
         return stats
+    @staticmethod
+    def _slice_time_dim(data, start: int, end: int | None):
+        """对张量/张量字典在第1维（时间维）切片，兼容None
+        Args:
+            data: None / 单个张量 / {key: 张量} 字典
+            start: 起始索引（包含）
+            end: 结束索引（不包含），None表示到末尾
+        """
+        if data is None:
+            return None
+        if isinstance(data, dict):
+            return {k: v[:, start:end, ...] for k, v in data.items()}
+        # 单个张量直接切片
+        return data[:, start:end, ...]
 
     def _compute_loss_critic(self, batch: dict[str, Any]) -> Tensor:
-        # Extract common components from batch
+        # 提取通用组件
         observations = batch["state"]
         actions = batch[ACTION]
         observation_features = batch.get("observation_feature")
+        
+        # ========== 提取序列初始隐藏态 ==========
+        initial_hidden = batch.get("initial_hidden", None)
+        next_initial_hidden = batch.get("next_initial_hidden", None)
 
-        # Extract critic-specific components
-        rewards = batch["reward"].squeeze(-1)  # 兼容单步[B,1]和序列[B,L,1]，统一去掉最后一维
+        # 提取Critic专用组件
+        rewards = batch["reward"].squeeze(-1)  # [B] 或 [B, L]
         next_observations = batch["next_state"]
         done = batch["done"].squeeze(-1)
         next_observation_features = batch.get("next_observation_feature")
 
         with torch.no_grad():
             next_action_preds, next_log_probs, _ = self.policy.actor(
-                next_observations, next_observation_features, mode="train"
+                next_observations,
+                next_observation_features,
+                mode="train",
+                hidden_in=next_initial_hidden,
             )
-
-            # 2- compute q targets
+            # 计算target Q值
             q_targets = self._critic_forward(
                 observations=next_observations,
                 actions=next_action_preds,
                 use_target=True,
                 observation_features=next_observation_features,
+                hidden_in=next_initial_hidden,
             )
-
-            # subsample critics to prevent overfitting if use high UTD (update to date)
             if self.config.num_subsample_critics is not None:
                 indices = torch.randperm(self.config.num_critics)
                 indices = indices[: self.config.num_subsample_critics]
                 q_targets = q_targets[indices]
-
-            # critics subsample size
-            min_q, _ = q_targets.min(dim=0)  # Get values from min operation
+            min_q, _ = q_targets.min(dim=0)
             if self.config.use_backup_entropy:
                 min_q = min_q - (self.temperature * next_log_probs)
-
-            # Bellman方程：单步/序列通用，逐元素计算
+            # Bellman方程：完整序列目标值
             td_target = rewards + (1 - done) * self.config.discount * min_q
 
-        # 3- compute predicted qs
+        # 计算当前预测Q值
         if self.policy_config.num_discrete_actions is not None:
-            # NOTE: We only want to keep the continuous action part
             actions: Tensor = actions[..., :DISCRETE_DIMENSION_INDEX]
-
         q_preds = self._critic_forward(
             observations=observations,
             actions=actions,
             use_target=False,
             observation_features=observation_features,
+            hidden_in=initial_hidden,
         )
 
-        # 4- Calculate loss
-        # 通用维度适配：单步shape [e, b]，序列shape [e, b, l]，均对非critic维度求平均
-        td_target_duplicate = einops.repeat(td_target, "... -> e ...", e=q_preds.shape[0])
-        # ========== 【新增】BPTT截断：仅对最后 bptt_truncate_len 步计算损失 ==========
+        # ========== 标准BPTT截断：仅有效段回传梯度 ==========
         if self.config.use_sequence and self.config.bptt_truncate_len is not None:
-            seq_len = td_target.shape[-1]
+            seq_len = rewards.shape[-1]
             keep_len = min(self.config.bptt_truncate_len, seq_len)
-            # 构造掩码：前序步不回传梯度，仅末尾有效步参与损失计算
-            mask = torch.zeros_like(td_target_duplicate)
-            mask[..., -keep_len:] = 1.0
-            td_target_duplicate = td_target_duplicate * mask
-            q_preds = q_preds * mask
-            # 损失按有效步数归一化
+            burn_in_len = seq_len - keep_len
+
+            # 目标Q值在no_grad内，直接截取有效段
+            td_target_valid = td_target[:, burn_in_len:]
+
+            # 预热段前向得到截断点隐藏态，detach断开梯度
+            if burn_in_len > 0:
+                burn_obs = {k: v[:, :burn_in_len, ...] for k, v in observations.items()}
+                burn_actions = actions[:, :burn_in_len, ...]
+                # 修复：用辅助函数切片图像特征字典
+                burn_obs_feat = self._slice_time_dim(observation_features, 0, burn_in_len)
+
+                _, burn_hidden = self._critic_forward(
+                    observations=burn_obs,
+                    actions=burn_actions,
+                    use_target=False,
+                    observation_features=burn_obs_feat,
+                    hidden_in=initial_hidden,
+                    return_hidden=True,
+                )
+                # 核心：截断梯度
+                trunc_hidden = [h.detach() for h in burn_hidden]
+            else:
+                trunc_hidden = initial_hidden
+
+            # 有效段输入
+            valid_obs = {k: v[:, burn_in_len:, ...] for k, v in observations.items()}
+            valid_actions = actions[:, burn_in_len:, ...]
+            # 修复：用辅助函数切片图像特征字典
+            valid_obs_feat = self._slice_time_dim(observation_features, burn_in_len, None)
+
+            # 有效段前向
+            q_preds_valid = self._critic_forward(
+                observations=valid_obs,
+                actions=valid_actions,
+                use_target=False,
+                observation_features=valid_obs_feat,
+                hidden_in=trunc_hidden,
+            )
+
+            # 计算有效段MSE损失
+            td_target_dup = einops.repeat(td_target_valid, "... -> e ...", e=q_preds_valid.shape[0])
             critics_loss = (
                 F.mse_loss(
-                    input=q_preds,
-                    target=td_target_duplicate,
+                    input=q_preds_valid,
+                    target=td_target_dup,
                     reduction="none",
-                ).mean(dim=tuple(range(1, q_preds.ndim)))
-            ).sum() / keep_len
+                ).mean(dim=tuple(range(1, q_preds_valid.ndim)))
+            ).sum()
         else:
+            # 全序列损失计算
+            td_target_dup = einops.repeat(td_target, "... -> e ...", e=q_preds.shape[0])
             critics_loss = (
                 F.mse_loss(
                     input=q_preds,
-                    target=td_target_duplicate,
+                    target=td_target_dup,
                     reduction="none",
                 ).mean(dim=tuple(range(1, q_preds.ndim)))
             ).sum()
@@ -419,39 +469,96 @@ class SACAlgorithm(RLAlgorithm):
     def _compute_loss_actor(self, batch: dict[str, Any]) -> Tensor:
         observations = batch["state"]
         observation_features = batch.get("observation_feature")
+        initial_hidden = batch.get("initial_hidden", None)
 
-        # 策略前向采样动作，训练模式下自动适配序列维度
-        actions_pi, log_probs, _ = self.policy.actor(
-            observations, observation_features, mode="train"
-        )
+        if self.config.use_sequence and self.config.bptt_truncate_len is not None:
+            seq_len = observations[next(iter(observations.keys()))].shape[1]
+            keep_len = min(self.config.bptt_truncate_len, seq_len)
+            burn_in_len = seq_len - keep_len
 
-        # 计算当前Q值，自动兼容单步/序列输出形状
-        q_preds = self._critic_forward(
-            observations=observations,
-            actions=actions_pi,
-            use_target=False,
-            observation_features=observation_features,
-        )
-        min_q_preds = q_preds.min(dim=0)[0]
+            # 预热段：仅前向得到截断点隐藏态，断开梯度
+            if burn_in_len > 0:
+                burn_obs = {k: v[:, :burn_in_len, ...] for k, v in observations.items()}
+                # 修复：用辅助函数切片
+                burn_obs_feat = self._slice_time_dim(observation_features, 0, burn_in_len)
 
-        # 自动适配：单步对batch平均，序列对batch+seq_len平均
-        actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
+                _, _, _, burn_hidden = self.policy.actor(
+                    burn_obs, burn_obs_feat,
+                    mode="train", hidden_in=initial_hidden,
+                    return_hidden=True,
+                )
+                trunc_hidden = burn_hidden.detach()
+            else:
+                trunc_hidden = initial_hidden
+
+            # 有效段：计算动作与对数概率
+            valid_obs = {k: v[:, burn_in_len:, ...] for k, v in observations.items()}
+            # 修复：用辅助函数切片
+            valid_obs_feat = self._slice_time_dim(observation_features, burn_in_len, None)
+
+            actions_pi, log_probs, _ = self.policy.actor(
+                valid_obs, valid_obs_feat,
+                mode="train", hidden_in=trunc_hidden,
+            )
+
+            # Critic同步使用有效段与截断隐藏态
+            q_preds = self._critic_forward(
+                observations=valid_obs,
+                actions=actions_pi,
+                use_target=False,
+                observation_features=valid_obs_feat,
+                hidden_in=trunc_hidden,
+            )
+            min_q_preds = q_preds.min(dim=0)[0]
+            actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
+        else:
+            # 原有全序列计算逻辑
+            actions_pi, log_probs, _ = self.policy.actor(
+                observations, observation_features, mode="train", hidden_in=initial_hidden
+            )
+            q_preds = self._critic_forward(
+                observations=observations, actions=actions_pi,
+                use_target=False, observation_features=observation_features,
+                hidden_in=initial_hidden,
+            )
+            min_q_preds = q_preds.min(dim=0)[0]
+            actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
+
         return actor_loss
+
+
     # ======================================================
       
     def _compute_loss_temperature(self, batch: dict[str, Any]) -> Tensor:
-        """Compute the temperature loss"""
         observations = batch["state"]
         observation_features = batch.get("observation_feature")
+        initial_hidden = batch.get("initial_hidden", None)
 
         with torch.no_grad():
-            # 显式指定训练模式，与损失计算处风格统一
-            _, log_probs, _ = self.policy.actor(
-                observations, observation_features, mode="train"
-            )
+            if self.config.use_sequence and self.config.bptt_truncate_len is not None:
+                seq_len = observations[next(iter(observations.keys()))].shape[1]
+                keep_len = min(self.config.bptt_truncate_len, seq_len)
+                burn_in_len = seq_len - keep_len
+
+                # 只取有效段计算log_probs
+                valid_obs = {k: v[:, burn_in_len:, ...] for k, v in observations.items()}
+                # 修复：用辅助函数切片
+                valid_obs_feat = self._slice_time_dim(observation_features, burn_in_len, None)
+
+                _, log_probs, _ = self.policy.actor(
+                    valid_obs, valid_obs_feat,
+                    mode="train", hidden_in=initial_hidden,
+                )
+            else:
+                _, log_probs, _ = self.policy.actor(
+                    observations, observation_features,
+                    mode="train", hidden_in=initial_hidden,
+                )
 
         temperature_loss = (-self.log_alpha.exp() * (log_probs + self.target_entropy)).mean()
         return temperature_loss
+
+
 
     def _update_target_networks(self) -> None:
         """Update target networks with exponential moving average"""
@@ -664,7 +771,6 @@ class CriticHead(nn.Module):
         dropout_rate: float | None = None,
         init_final: float | None = None,
         final_activation: Callable[[torch.Tensor], torch.Tensor] | str | None = None,
-        # 【GRU新增参数】
         use_gru: bool = False,
         gru_hidden_size: int = 64,
         num_gru_layers: int = 2,
@@ -672,7 +778,6 @@ class CriticHead(nn.Module):
     ):
         super().__init__()
         self.use_gru = use_gru
-
         # GRU层：放在MLP之前，做时序建模
         if self.use_gru:
             self.gru = nn.GRU(
@@ -682,11 +787,14 @@ class CriticHead(nn.Module):
                 batch_first=True,
                 dropout=gru_dropout,
             )
+            # 正交初始化GRU权重，提升初始数值稳定性
+            for name, param in self.gru.named_parameters():
+                if 'weight' in name:
+                    nn.init.orthogonal_(param, gain=0.5)
             mlp_input_dim = gru_hidden_size
         else:
             self.gru = None
             mlp_input_dim = input_dim
-
         # MLP主干
         self.net = MLP(
             input_dim=mlp_input_dim,
@@ -696,7 +804,6 @@ class CriticHead(nn.Module):
             dropout_rate=dropout_rate,
             final_activation=final_activation,
         )
-
         # Q值输出层
         self.output_layer = nn.Linear(in_features=hidden_dims[-1], out_features=1)
         if init_final is not None:
@@ -705,33 +812,38 @@ class CriticHead(nn.Module):
         else:
             orthogonal_init()(self.output_layer.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x 形状：单步 [B, D] / 序列 [B, L, D]
+    def forward(
+        self,
+        x: torch.Tensor,
+        hidden_in: torch.Tensor | None = None,
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: 输入特征 [B, D] 或 [B, L, D]
+            hidden_in: GRU初始隐藏态
+            return_hidden: 是否返回最终隐藏态，用于BPTT截断
+        Returns:
+            q_values: Q值张量
+            hidden_out: 最终隐藏态（仅return_hidden=True时返回）
+        """
         if self.use_gru:
             if not hasattr(self, '_flattened'):
                 self.gru.flatten_parameters()
                 setattr(self, '_flattened', True)
-            # 零初始化隐藏态，与Actor训练模式对齐
-            x, _ = self.gru(x)  # 输出形状：单步自动适配，序列为 [B, L, H]
-        # MLP + 输出层
+            x, hidden_out = self.gru(x, hidden_in)
+        else:
+            hidden_out = None
+
         q = self.output_layer(self.net(x))
-        # 去掉最后一维的Q值维度，输出形状：单步 [B] / 序列 [B, L]
-        return q.squeeze(-1)
+        q = q.squeeze(-1)
+
+        if return_hidden:
+            return q, hidden_out
+        return q
+
 
 class CriticEnsemble(nn.Module):
-    """
-    CriticEnsemble wraps multiple CriticHead modules into an ensemble.
-
-    Args:
-        encoder (GaussianActorObservationEncoder): encoder for observations.
-        ensemble (List[CriticHead]): list of critic heads.
-        init_final (float | None): optional initializer scale for final layers.
-
-    Forward returns:
-        - 单步模式: shape (num_critics, batch_size)
-        - 序列模式: shape (num_critics, batch_size, seq_len)
-    """
-
     def __init__(
         self,
         encoder: GaussianActorObservationEncoder,
@@ -748,21 +860,30 @@ class CriticEnsemble(nn.Module):
         observations: dict[str, torch.Tensor],
         actions: torch.Tensor,
         observation_features: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        hidden_in: torch.Tensor | list[torch.Tensor] | None = None,
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         device = get_device_from_parameters(self)
         observations = {k: v.to(device) for k, v in observations.items()}
-
-        # 编码器自动适配单步/序列输入
         obs_enc = self.encoder(observations, cache=observation_features)
-
-        # 拼接观测特征与动作：单步 [B, D+A]，序列 [B, L, D+A]
         inputs = torch.cat([obs_enc, actions], dim=-1)
 
-        # 逐个Critic计算Q值
         q_values = []
-        for critic in self.critics:
-            q_values.append(critic(inputs))
+        hidden_states = []
+        for i, critic in enumerate(self.critics):
+            # 兼容单张量共享 / 列表逐head分配两种模式
+            curr_hidden = hidden_in[i] if isinstance(hidden_in, list) else hidden_in
+            
+            if return_hidden:
+                q, h = critic(inputs, hidden_in=curr_hidden, return_hidden=True)
+                q_values.append(q)
+                hidden_states.append(h)
+            else:
+                q_values.append(critic(inputs, hidden_in=curr_hidden))
 
-        # 在第0维堆叠：得到 [num_critics, B] 或 [num_critics, B, L]
         q_values = torch.stack(q_values, dim=0)
+        if return_hidden:
+            return q_values, hidden_states
         return q_values
+
+

@@ -320,6 +320,7 @@ def act_with_policy(
         # Add counters for intervention rate calculation
         episode_intervention_steps = 0
         episode_total_steps = 0
+        was_intervention = False  # 记录上一步是否为干预状态，用于干预结束后同步隐藏态
 
         policy_timer = TimerManager("Policy inference", log=False)
         
@@ -363,6 +364,8 @@ def act_with_policy(
 
                 # 每步都正常推理，保证动作永远有效
                 # GRU隐藏态会跟随真实观测自动更新，干预期间也保持连续
+                # 在 policy.select_action 之前，记录当前隐藏态
+                current_hidden = policy.actor._hidden_state.clone()
                 action = policy.select_action(batch=normalized_observation)
 
                 # Unnormalize only the continuous part.
@@ -414,7 +417,17 @@ def act_with_policy(
             if is_intervention:
                 episode_intervention = True
                 episode_intervention_steps += 1
-
+                # ========== 修复：干预期间冻结GRU隐藏态 ==========
+                # 人类接管时真实动作与策略动作脱节，隐藏态继续更新会严重漂移
+                # 用干预前保存的隐藏态覆盖，不累积干预期间的时序误差
+                policy.actor._hidden_state = current_hidden.to(policy.actor._hidden_state.device)
+            else:
+                # ========== 修复：干预结束后第一步，强制同步隐藏态 ==========
+                # 用真实观测刷新GRU状态，让隐藏态重新对齐真实轨迹
+                if was_intervention:
+                    policy.update_hidden(normalized_observation)
+            # 更新上一步干预标记
+            was_intervention = is_intervention
 
 
             complementary_info = {
@@ -423,6 +436,8 @@ def act_with_policy(
                 ),
                 TeleopEvents.IS_INTERVENTION.value: is_intervention,
             }
+            # 存入complementary_info，随transition一起发给learner
+            complementary_info["initial_hidden"] = current_hidden.cpu()
             # Create transition for learner (convert to old format)
             list_transition_to_send_to_learner.append(
                 Transition(
@@ -476,6 +491,7 @@ def act_with_policy(
                 episode_intervention = False
                 episode_intervention_steps = 0
                 episode_total_steps = 0
+                was_intervention = False
 
                 transition = reset_and_build_transition(online_env, env_processor, action_processor)
                 # ========== 【GRU 改造】首个 episode 初始化隐藏态 ==========

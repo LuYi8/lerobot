@@ -3,10 +3,10 @@
     "job_name": "default",
     "resume": false,
     "seed": 1000,
-    "num_workers": 12,
-    "batch_size": 4,
-    "steps": 10000,
-    "log_freq": 1,
+    "num_workers": 16,
+    "batch_size": 16,
+    "steps": 20000,
+    "log_freq": 10,
     "save_checkpoint": true,
     "save_freq": 1000,
     "wandb": {
@@ -428,15 +428,15 @@
                 ]
             }
         },
-        "num_discrete_actions": null,
+        "num_discrete_actions": 2,
         "storage_device": "cpu",
         "vision_encoder_name": "/home/embody/lerobot/resnet10",
         "freeze_vision_encoder": true,
         "image_encoder_hidden_dim": 32,
         "shared_encoder": true,
         "online_steps": 100000,
-        "online_buffer_capacity": 8000,
-        "offline_buffer_capacity": 5000,
+        "online_buffer_capacity": 6000,
+        "offline_buffer_capacity": 1500,
         "online_step_before_learning": 100,
         "state_encoder_hidden_dim": 64,
         "latent_dim": 64,
@@ -483,7 +483,7 @@
             "control_mode": "keyboard",
             "gripper": {
                 "use_gripper": true,
-                "gripper_penalty": -0.2
+                "gripper_penalty": -0.1
             },
             "reset": {
                 "fixed_reset_joint_positions": [

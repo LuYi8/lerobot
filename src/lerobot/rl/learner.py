@@ -987,8 +987,12 @@ def process_transitions(
             ):
                 logging.warning("[LEARNER] NaN detected in transition, skipping")
                 continue
-
-            replay_buffer.add(**transition)
+            # 提取隐藏态（没有则为None，兼容旧版数据）
+            hidden_state = transition.get("complementary_info", {}).pop("initial_hidden", None)
+            replay_buffer.add(
+                **transition,
+                hidden_state=hidden_state,
+            )
 
             # Add to offline buffer if it's an intervention
             if dataset_repo_id is not None and transition.get("complementary_info", {}).get(
