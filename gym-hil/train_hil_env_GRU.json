@@ -32,7 +32,7 @@
         "num_critics": 2,
         "num_subsample_critics": null,
         "use_sequence": true,
-        "seq_len": 8,
+        "seq_len": 12,
         "bptt_truncate_len": null,
         "critic_gru_hidden_size": 64,
         "num_critic_gru_layers": 2,

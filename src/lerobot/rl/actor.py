@@ -311,7 +311,8 @@ def act_with_policy(
         
         logging.debug("Reset GRU hidden state at episode start")
         policy.reset()
-
+        # 新增：初始化时序记录隐藏态，始终随观测推进，用于存储训练数据
+        recording_hidden = policy.actor._hidden_state.clone()
         
         # NOTE: For the moment we will solely handle the case of a single environment
         sum_reward_episode = 0
@@ -321,7 +322,6 @@ def act_with_policy(
         episode_intervention_steps = 0
         episode_total_steps = 0
         was_intervention = False  # 记录上一步是否为干预状态，用于干预结束后同步隐藏态
-
         policy_timer = TimerManager("Policy inference", log=False)
         
         for interaction_step in range(cfg.policy.online_steps):
@@ -333,54 +333,60 @@ def act_with_policy(
             observation = {
                 k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
             }
+            # ========== 新增：前置干预检测，跳过无效推理 ==========
+            # 优先查询设备实时干预状态；无接口则用上个状态预判
+            # 统一一处执行推理，保证每步仅调用一次 select_action
+            is_intervening = (
+                teleop_device.get_intervention_state()
+                if hasattr(teleop_device, 'get_intervention_state')
+                else was_intervention
+            )
+            # ========== 新增：干预结束同步（直接复用记录隐藏态）==========
+            if was_intervention and not is_intervening:
+                # 直接用记录隐藏态覆盖策略隐藏态，一步完成同步
+                policy.actor._hidden_state = recording_hidden.clone()
+                logging.debug("干预结束，已同步GRU隐藏态")
+            # ======================================================
 
-            # Time policy inference and check if it meets FPS requirement
-            # Time policy inference and check if it meets FPS requirement
+            
+
             with policy_timer:
-                # ========== 新增：原始观测 NaN 检测 ==========
+                # 观测预处理（无论是否干预都执行，用于后续隐藏态同步）
                 raw_has_nan = any(
-                    torch.isnan(v).any() 
-                    for v in observation.values() 
-                    if isinstance(v, torch.Tensor)
+                    torch.isnan(v).any() for v in observation.values() if isinstance(v, torch.Tensor)
                 )
                 if raw_has_nan:
                     logging.warning("[DEBUG] Raw observation from env has NaN!")
-
                 normalized_observation = preprocessor.process_observation(observation)
-                # 新增：观测最终兜底，任何异常值都替换为0
                 for k in normalized_observation:
                     if isinstance(normalized_observation[k], torch.Tensor):
                         normalized_observation[k] = torch.nan_to_num(
                             normalized_observation[k], nan=0.0, posinf=1.0, neginf=-1.0
                         )
-                # ========== 新增：归一化后 NaN 检测 ==========
-                norm_has_nan = any(
-                    torch.isnan(v).any() 
-                    for v in normalized_observation.values() 
-                    if isinstance(v, torch.Tensor)
-                )
-                if norm_has_nan and not raw_has_nan:
-                    logging.warning("[DEBUG] NaN introduced by observation normalizer!")
 
-                # 每步都正常推理，保证动作永远有效
-                # GRU隐藏态会跟随真实观测自动更新，干预期间也保持连续
-                # 在 policy.select_action 之前，记录当前隐藏态
+                # 记录干预前隐藏态，干预时回退
                 current_hidden = policy.actor._hidden_state.clone()
-                action = policy.select_action(batch=normalized_observation)
 
-                # Unnormalize only the continuous part.
-                if cfg.policy.num_discrete_actions is not None:
-                    #修改
-                    continuous_action = postprocessor.process_action(action[..., :-1])
-                    #continuous_action = postprocessor.process_action(action)
-                    #结束
-                    discrete_action = action[..., -1:].to(
-                        device=continuous_action.device, dtype=continuous_action.dtype
-                    )
-                    action = torch.cat([continuous_action, discrete_action], dim=-1)
+                if not is_intervening:
+                    # 非干预：正常推理，GRU 隐藏态自动前进一步
+                    action = policy.select_action(batch=normalized_observation)
+                    if cfg.policy.num_discrete_actions is not None:
+                        continuous_action = postprocessor.process_action(action[..., :-1])
+                        discrete_action = action[..., -1:].to(
+                            device=continuous_action.device, dtype=continuous_action.dtype
+                        )
+                        action = torch.cat([continuous_action, discrete_action], dim=-1)
+                    else:
+                        action = postprocessor.process_action(action)
                 else:
-                    action = postprocessor.process_action(action)
-            policy_fps = policy_timer.fps_last
+                    # 干预：生成占位动作，不推进 GRU
+                    action = torch.zeros(
+                        (1, online_env.action_space.shape[0]),
+                        device=device, dtype=torch.float32
+                    )
+
+            policy_fps = policy_timer.fps_last if not is_intervening else float('inf')
+
 
             log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
 
@@ -414,21 +420,33 @@ def act_with_policy(
             # Check for intervention from transition info
             intervention_info = new_transition[TransitionKey.INFO]
             is_intervention = bool(intervention_info.get(TeleopEvents.IS_INTERVENTION, False))
+            # 【修复】修正预判偏差：预判干预但实际未干预，补推一步隐藏态
+            if is_intervening and not is_intervention:
+                policy.update_hidden(normalized_observation)
+                logging.debug("干预预判偏差，已补更GRU隐藏态，对齐时序")
             if is_intervention:
                 episode_intervention = True
                 episode_intervention_steps += 1
-                # ========== 修复：干预期间冻结GRU隐藏态 ==========
-                # 人类接管时真实动作与策略动作脱节，隐藏态继续更新会严重漂移
-                # 用干预前保存的隐藏态覆盖，不累积干预期间的时序误差
+                # ========== 修复：双隐藏态分离 ==========
+                # 1. 策略推理隐藏态：冻结回退，避免人类动作导致策略隐藏态漂移
                 policy.actor._hidden_state = current_hidden.to(policy.actor._hidden_state.device)
+                
+                # 2. 时序记录隐藏态：用当前观测正常推进，保证训练数据时序正确
+                with torch.no_grad():
+                    # 与推理路径完全一致的编码 + 数值兜底
+                    obs_enc = policy.actor.encoder(normalized_observation, detach=policy.actor.encoder_is_shared)
+                    obs_enc = torch.nan_to_num(obs_enc, nan=0.0, posinf=10.0, neginf=-10.0)
+                    obs_enc = obs_enc.unsqueeze(1)  # [B, 1, D] 适配GRU输入
+                    _, recording_hidden = policy.actor.gru(obs_enc, recording_hidden)
+                    # 与推理路径对齐的数值兜底
+                    recording_hidden = torch.nan_to_num(recording_hidden, nan=0.0, posinf=20.0, neginf=-20.0)
             else:
-                # ========== 修复：干预结束后第一步，强制同步隐藏态 ==========
-                # 用真实观测刷新GRU状态，让隐藏态重新对齐真实轨迹
-                if was_intervention:
-                    policy.update_hidden(normalized_observation)
+                # 非干预步：记录隐藏态与策略隐藏态保持同步
+                recording_hidden = policy.actor._hidden_state.clone()
+            # ======================================================
+
             # 更新上一步干预标记
             was_intervention = is_intervention
-
 
             complementary_info = {
                 "discrete_penalty": torch.tensor(
@@ -436,8 +454,9 @@ def act_with_policy(
                 ),
                 TeleopEvents.IS_INTERVENTION.value: is_intervention,
             }
-            # 存入complementary_info，随transition一起发给learner
-            complementary_info["initial_hidden"] = current_hidden.cpu()
+            # 存入记录隐藏态（而非策略隐藏态），保证训练时序正确性
+            complementary_info["initial_hidden"] = recording_hidden.cpu()
+
             # Create transition for learner (convert to old format)
             list_transition_to_send_to_learner.append(
                 Transition(
@@ -455,25 +474,26 @@ def act_with_policy(
 
             if done or truncated:
                 logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
-
+                
+                # 1. 加载 Learner 推送的最新权重
                 update_policy_parameters(algorithm=algorithm, parameters_queue=parameters_queue, device=device)
+                
 
+
+                # 3. 推送本回合采集数据
                 if len(list_transition_to_send_to_learner) > 0:
                     push_transitions_to_transport_queue(
                         transitions=list_transition_to_send_to_learner,
                         transitions_queue=transitions_queue,
                     )
                     list_transition_to_send_to_learner = []
-
+                
+                # 以下原有统计、重置逻辑保持不变
                 stats = get_frequency_stats(policy_timer)
                 policy_timer.reset()
-
-                # Calculate intervention rate
                 intervention_rate = 0.0
                 if episode_total_steps > 0:
                     intervention_rate = episode_intervention_steps / episode_total_steps
-
-                # Send episodic reward to the learner
                 interactions_queue.put(
                     python_object_to_bytes(
                         {
@@ -485,19 +505,16 @@ def act_with_policy(
                         }
                     )
                 )
-
-                # Reset intervention counters and environment
                 sum_reward_episode = 0.0
                 episode_intervention = False
                 episode_intervention_steps = 0
                 episode_total_steps = 0
                 was_intervention = False
-
                 transition = reset_and_build_transition(online_env, env_processor, action_processor)
-                # ========== 【GRU 改造】首个 episode 初始化隐藏态 ==========
-                # use_gru=False 时该方法为空操作，完全兼容原有单步模式
                 logging.debug("Reset GRU hidden state at episode start")
                 policy.reset()
+                recording_hidden = policy.actor._hidden_state.clone()
+
 
 
             if cfg.env.fps is not None:
@@ -807,7 +824,13 @@ def update_policy_parameters(algorithm: RLAlgorithm, parameters_queue: Queue, de
         # - Skip encoder params entirely when freeze_vision_encoder=True
         # - Ensure discrete_critic gets correct encoder state (currently uses encoder_critic)
         algorithm.load_weights(state_dicts, device=device)
+        # 权重更新后不清零隐藏态，避免episode中途时序断裂
+        # 说明：新旧权重隐藏态语义存在偏移，但直接清零会导致策略输出突变，
+        # 真实机器人场景下风险更高；保留隐藏态运行，GRU会在数步内自行收敛
+        logging.debug("[ACTOR] Loaded new policy weights, kept GRU hidden state.")
 
+
+        # ======================================================
         # ========== 新增：权重NaN检测 ==========
         has_nan = False
         for name, param in algorithm.policy.named_parameters():
@@ -816,7 +839,7 @@ def update_policy_parameters(algorithm: RLAlgorithm, parameters_queue: Queue, de
                 has_nan = True
         if has_nan:
             logging.error("[CRITICAL] Loaded weights from learner contain NaN! Policy will be unstable.")
-
+        
 
 #  Utilities functions
 

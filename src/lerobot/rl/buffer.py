@@ -37,6 +37,7 @@ class BatchTransition(TypedDict):
     complementary_info: dict[str, torch.Tensor | float | int] | None = None
     # 新增：序列初始隐藏态，仅在 store_hidden_states=True 时存在
     initial_hidden: torch.Tensor | None = None
+    next_initial_hidden: torch.Tensor | None = None
 
 def random_crop_vectorized(images: torch.Tensor, output_size: tuple) -> torch.Tensor:
     """
@@ -120,7 +121,7 @@ class ReplayBuffer:
         self.optimize_memory = optimize_memory
         self._lock = threading.Lock()
         # Track episode boundaries for memory optimization
-        self.episode_ends = torch.zeros(capacity, dtype=torch.bool, device=storage_device)
+        #self.episode_ends = torch.zeros(capacity, dtype=torch.bool, device=storage_device)
         # If no state_keys provided, default to an empty list
         self.state_keys = state_keys if state_keys is not None else []
         self.image_augmentation_function = image_augmentation_function
@@ -255,19 +256,57 @@ class ReplayBuffer:
                         elif isinstance(value, (int | float)):
                             self.complementary_info[key][self.position] = value
 
-            # ========== 新增：存储当前步隐藏态 ==========
+            # ========== 新增：存储当前步隐藏态（兼容无隐藏态旧数据） ==========
             if self.store_hidden_states:
                 if hidden_state is None:
-                    raise ValueError(
-                        "store_hidden_states=True but no hidden_state provided in add()"
+                    # 无隐藏态输入：自动零初始化填充，兼容旧数据集
+                    num_layers, hidden_size = self.hidden_shape
+                    hidden_state = torch.zeros(num_layers, hidden_size, device=self.storage_device)
+                    warnings.warn(
+                        "store_hidden_states=True but no hidden_state provided. Filled with zero hidden state. "
+                        "This may slightly degrade temporal modeling performance.",
+                        UserWarning, stacklevel=2
                     )
-                # 统一去掉batch维度：从 [num_layers, 1, hidden_size] -> [num_layers, hidden_size]
-                if hidden_state.ndim == 3:
-                    hidden_state = hidden_state.squeeze(1)
-                # 移到存储设备后写入
-                self.hidden_states[self.position].copy_(
-                    hidden_state.to(self.storage_device)
-                )
+                else:
+                    # 统一去掉batch维度：从 [num_layers, 1, hidden_size] -> [num_layers, hidden_size]
+                    if hidden_state.ndim == 3:
+                        hidden_state = hidden_state.squeeze(1)
+                    hidden_state = hidden_state.to(self.storage_device)
+                # 写入存储张量
+                self.hidden_states[self.position].copy_(hidden_state)
+            
+            # ========== 【优化后】序列模式：环形覆盖O(1)均摊清理 ==========
+            if self.use_sequence and self.size == self.capacity:
+                overwritten_pos = self.position
+                removed_count = 0
+
+                # 仅从队首检查：被覆盖的一定是最早的episode，后续episode更晚不会包含该位置
+                while self.valid_episodes:
+                    ep_start, ep_len = self.valid_episodes[0]
+                    ep_end = (ep_start + ep_len) % self.capacity
+
+                    # 判断该episode是否包含被覆盖位置
+                    if ep_start < ep_end:
+                        is_covered = ep_start <= overwritten_pos < ep_end
+                    else:
+                        is_covered = overwritten_pos >= ep_start or overwritten_pos < ep_end
+
+                    if is_covered:
+                        self.valid_episodes.pop(0)
+                        removed_count += 1
+                    else:
+                        break  # 后续episode均晚于当前，不可能包含更旧的位置，直接退出
+
+                if removed_count > 0 and not self._seq_cover_warned:
+                    warnings.warn(
+                        f"ReplayBuffer full: {removed_count} old episode(s) overwritten in sequence mode.",
+                        UserWarning, stacklevel=2
+                    )
+                    self._seq_cover_warned = True
+            # ======================================================
+
+
+
             # ========== 【修改后】序列模式：更新episode边界 ==========
             if self.use_sequence:
                 if done or truncated:
@@ -278,28 +317,6 @@ class ReplayBuffer:
                         self.valid_episodes.append((self._current_episode_start, episode_length))
                     self._current_episode_start = (self.position + 1) % self.capacity
 
-            # 
-            # ========== 【修复】序列模式：安全版旧episode清理逻辑 ==========
-            if self.use_sequence and self.size == self.capacity:
-                # 硬限制最大清理次数，从根本上杜绝死循环
-                max_clean = len(self.valid_episodes)
-                cleaned = 0
-                while self.valid_episodes and cleaned < max_clean:
-                    ep_start, _ = self.valid_episodes[0]
-                    # 保守判断：只有episode起始位置被覆盖，才移除整个episode
-                    # 逻辑简单无边界漏洞，不会死循环；起始位被覆盖则最老数据已失效，移除整条轨迹合理
-                    if ep_start == self.position:
-                        self.valid_episodes.pop(0)
-                        cleaned += 1
-                        if not self._seq_cover_warned:
-                            warnings.warn(
-                                "ReplayBuffer is full under sequence mode. Old episodes are being overwritten. "
-                                "It is recommended to use a larger buffer capacity to avoid data loss.",
-                                UserWarning, stacklevel=2
-                            )
-                            self._seq_cover_warned = True
-                    else:
-                        break
 
             # 全局仅保留一次指针更新
             self.position = (self.position + 1) % self.capacity
@@ -331,6 +348,17 @@ class ReplayBuffer:
                     next_idx = (idx + 1) % self.capacity
                     batch_next_state[key] = self.states[key][next_idx].to(self.device)
 
+                    # ========== 新增：单步模式修复episode边界 ==========
+                    done_mask = self.dones[idx].to(self.device).view(-1, 1)
+                    mask_shape = [1] * batch_state[key].ndim
+                    mask_shape[0] = done_mask.shape[0]
+                    done_mask_expanded = done_mask.view(*mask_shape)
+                    batch_next_state[key] = torch.where(
+                        done_mask_expanded,
+                        batch_state[key],
+                        batch_next_state[key]
+                    )
+                    # ======================================================
             # Sample other tensors
             batch_actions = self.actions[idx].to(self.device)
             batch_rewards = self.rewards[idx].to(self.device)
@@ -417,11 +445,21 @@ class ReplayBuffer:
                 # 转换为GRU标准输入格式：[num_layers, batch_size, hidden_size]
                 batch_initial_hidden = batch_initial_hidden.permute(1, 0, 2).contiguous()
 
-                # 2. next_state序列初始隐藏态：序列第1步的输入隐藏态（错位1步）
-                # 环形buffer取模防止越界，与next_state的索引逻辑对齐
+                # 2. next_state序列初始隐藏态：与next_state语义对齐，done边界回退为当前步
                 next_start_idx = (idx[:, 0] + 1) % self.capacity
                 batch_next_initial_hidden = self.hidden_states[next_start_idx].to(self.device)
                 batch_next_initial_hidden = batch_next_initial_hidden.permute(1, 0, 2).contiguous()
+                
+                # done边界对齐：序列首步为done时，next隐藏态等于当前步隐藏态
+                first_done_mask = self.dones[idx[:, 0]].to(self.device)  # [B]
+                first_done_mask = first_done_mask.view(1, -1, 1)  # 广播到[num_layers, B, hidden_size]
+                batch_current_hidden = self.hidden_states[idx[:, 0]].to(self.device).permute(1, 0, 2).contiguous()
+                batch_next_initial_hidden = torch.where(
+                    first_done_mask,
+                    batch_current_hidden,
+                    batch_next_initial_hidden
+                )
+
             # 4. 提取所有特征张量
             batch_state = {}
             batch_next_state = {}
@@ -433,6 +471,20 @@ class ReplayBuffer:
                     next_idx = (idx + 1) % self.capacity
                     batch_next_state[key] = self.states[key][next_idx].to(self.device)
 
+                    # ========== 新增：修复episode边界next_state越界 ==========
+                    done_mask = self.dones[idx].to(self.device).unsqueeze(-1).unsqueeze(-1)
+                    # 广播mask到与state相同维度
+                    mask_shape = [1] * batch_state[key].ndim
+                    mask_shape[0] = done_mask.shape[0]
+                    mask_shape[1] = done_mask.shape[1]
+                    done_mask_expanded = done_mask.view(*mask_shape)
+                    # 终止步：next_state = 当前state；非终止步：保持原值
+                    batch_next_state[key] = torch.where(
+                        done_mask_expanded,
+                        batch_state[key],
+                        batch_next_state[key]
+                    )
+                    # ======================================================
             batch_actions = self.actions[idx].to(self.device)
             batch_rewards = self.rewards[idx].to(self.device)
             batch_dones = self.dones[idx].to(self.device).float()
@@ -598,6 +650,9 @@ class ReplayBuffer:
         # ========== 【新增】序列参数透传 ==========
         use_sequence: bool = False,
         seq_len: int | None = None,
+        # ========== 新增：隐藏态参数 ==========
+        store_hidden_states: bool = False,
+        hidden_shape: tuple[int, int] | None = None,
     ) -> "ReplayBuffer":
         """
         Convert a LeRobotDataset into a ReplayBuffer.
@@ -634,9 +689,12 @@ class ReplayBuffer:
             optimize_memory=optimize_memory,
             use_sequence=use_sequence,
             seq_len=seq_len,
+            # 修复：透传隐藏态配置
+            store_hidden_states=store_hidden_states,
+            hidden_shape=hidden_shape,
         )
         # Convert dataset to transitions
-        list_transition = cls._lerobotdataset_to_transitions(dataset=lerobot_dataset, state_keys=state_keys)
+        list_transition = cls._lerobotdataset_to_transitions(dataset=lerobot_dataset, state_keys=state_keys,hidden_shape=hidden_shape,)
         # Initialize the buffer with the first transition to set up storage tensors
         if list_transition:
             first_transition = list_transition[0]
@@ -655,23 +713,89 @@ class ReplayBuffer:
                 state=first_state, action=first_action, complementary_info=first_complementary_info
             )
         # Fill the buffer with all transitions
-        for data in list_transition:
-            for k, v in data.items():
-                if isinstance(v, dict):
-                    for key, tensor in v.items():
-                        v[key] = tensor.to(storage_device)
-                elif isinstance(v, torch.Tensor):
-                    data[k] = v.to(storage_device)
-            action = data[ACTION]
-            replay_buffer.add(
-                state=data["state"],
-                action=action,
-                reward=data["reward"],
-                next_state=data["next_state"],
-                done=data["done"],
-                truncated=False,  # NOTE: Truncation are not supported yet in lerobot dataset
-                complementary_info=data.get("complementary_info", None),
-            )
+        # ========== 替换原有逐行add循环，改为批量写入 ==========
+        if list_transition:
+            num_transitions = len(list_transition)
+            if num_transitions > replay_buffer.capacity:
+                raise ValueError("Number of transitions exceeds buffer capacity.")
+
+            # 1. 批量写入 state / next_state
+            for key in replay_buffer.states:
+                state_tensor = torch.cat([t["state"][key] for t in list_transition], dim=0)
+                replay_buffer.states[key][:num_transitions].copy_(state_tensor.to(storage_device))
+                if not replay_buffer.optimize_memory:
+                    next_tensor = torch.cat([t["next_state"][key] for t in list_transition], dim=0)
+                    replay_buffer.next_states[key][:num_transitions].copy_(next_tensor.to(storage_device))
+
+            # 2. 批量写入 action / reward / done / truncated
+            action_tensor = torch.cat([t[ACTION] for t in list_transition], dim=0)
+            replay_buffer.actions[:num_transitions].copy_(action_tensor.to(storage_device))
+
+            reward_tensor = torch.tensor([t["reward"] for t in list_transition], device=storage_device)
+            replay_buffer.rewards[:num_transitions].copy_(reward_tensor)
+
+            done_tensor = torch.tensor([t["done"] for t in list_transition], dtype=torch.bool, device=storage_device)
+            replay_buffer.dones[:num_transitions].copy_(done_tensor)
+
+            truncated_tensor = torch.tensor([t["truncated"] for t in list_transition], dtype=torch.bool, device=storage_device)
+            replay_buffer.truncateds[:num_transitions].copy_(truncated_tensor)
+
+            # 3. 批量写入 complementary_info
+            if replay_buffer.has_complementary_info:
+                for key in replay_buffer.complementary_info_keys:
+                    vals = [
+                        t["complementary_info"][key]
+                        for t in list_transition
+                        if t.get("complementary_info") and key in t["complementary_info"]
+                    ]
+                    if len(vals) == num_transitions:
+                        if isinstance(vals[0], torch.Tensor):
+                            val_tensor = torch.cat(vals, dim=0)
+                        else:
+                            val_tensor = torch.tensor(vals, device=storage_device)
+                        replay_buffer.complementary_info[key][:num_transitions].copy_(val_tensor.to(storage_device))
+
+            # 4. 批量写入隐藏态
+            if replay_buffer.store_hidden_states:
+                hidden_list = []
+                for t in list_transition:
+                    h = t.get("complementary_info", {}).get("initial_hidden", None)
+                    if h is None:
+                        h = torch.zeros(*replay_buffer.hidden_shape, device=storage_device)
+                    else:
+                        if h.ndim == 3:
+                            h = h.squeeze(0)
+                        h = h.to(storage_device)
+                    hidden_list.append(h)
+                hidden_tensor = torch.stack(hidden_list, dim=0)
+                replay_buffer.hidden_states[:num_transitions].copy_(hidden_tensor)
+
+            # 5. 批量构建 episode 索引（序列模式）
+            if replay_buffer.use_sequence:
+                replay_buffer.valid_episodes = []
+                ep_start = 0
+                current_ep_idx = None
+                for i in range(num_transitions):
+                    # 从数据集读取真实episode编号
+                    ep_idx = lerobot_dataset[i]["episode_index"].item()
+                    # episode切换时结算上一段轨迹
+                    if ep_idx != current_ep_idx:
+                        if current_ep_idx is not None:
+                            ep_len = i - ep_start
+                            if ep_len >= replay_buffer.seq_len:
+                                replay_buffer.valid_episodes.append((ep_start, ep_len))
+                        current_ep_idx = ep_idx
+                        ep_start = i
+                # 结算最后一个episode
+                ep_len = num_transitions - ep_start
+                if ep_len >= replay_buffer.seq_len:
+                    replay_buffer.valid_episodes.append((ep_start, ep_len))
+
+
+            # 6. 更新指针与容量
+            replay_buffer.position = num_transitions % replay_buffer.capacity
+            replay_buffer.size = num_transitions
+        # ======================================================
         return replay_buffer
 
     def to_lerobot_dataset(
@@ -714,6 +838,13 @@ class ReplayBuffer:
                     sample_val = sample_val.unsqueeze(0)
                 f_info = guess_feature_info(t=sample_val, name=f"complementary_info.{key}")
                 features[f"complementary_info.{key}"] = f_info
+        # ========== 新增：注册隐藏态特征，与写入帧数据的逻辑对齐 ==========
+        if self.store_hidden_states:
+            # 取第0个隐藏态展平后推导特征形状与类型
+            sample_hidden = self.hidden_states[0].flatten()
+            f_info = guess_feature_info(t=sample_hidden, name="complementary_info.initial_hidden")
+            features["complementary_info.initial_hidden"] = f_info
+        # ================================================================
         # Create an empty LeRobotDataset
         lerobot_dataset = LeRobotDataset.create(
             repo_id=repo_id,
@@ -749,7 +880,12 @@ class ReplayBuffer:
                     # Non-tensor values can be used directly
                     else:
                         frame_dict[f"complementary_info.{key}"] = val
-
+            # ========== 新增：写入GRU初始隐藏态到数据集 ==========
+            if self.store_hidden_states:
+                hidden = self.hidden_states[actual_idx].cpu()
+                # 展平为1维存入数据集，兼容LeRobotDataset特征体系
+                frame_dict["complementary_info.initial_hidden"] = hidden.flatten()
+            # ======================================================
             # 修改 ========= 新增：图像归一化 =========
             # 在 add_frame 之前，归一化所有图像
             for key, value in frame_dict.items():
@@ -785,6 +921,7 @@ class ReplayBuffer:
     def _lerobotdataset_to_transitions(
         dataset: LeRobotDataset,
         state_keys: Sequence[str] | None = None,
+        hidden_shape: tuple[int, int] | None = None,  # ✅ 新增参数传入
     ) -> list[Transition]:
         """
         Convert a LeRobotDataset into a list of RL (s, a, r, s', done) transitions.
@@ -876,6 +1013,15 @@ class ReplayBuffer:
                         # TODO: (azouitine) Check if it's necessary to convert to tensor
                         # For non-tensor values, use directly
                         complementary_info[clean_key] = val
+
+                # ========== 新增：恢复隐藏态原始形状 ==========
+                if "initial_hidden" in complementary_info:
+                    hidden_flat = complementary_info["initial_hidden"]
+                    # 从展平向量恢复为 [num_layers, hidden_size] 二维形状
+                    num_layers, hidden_size = hidden_shape
+                    complementary_info["initial_hidden"] = hidden_flat.reshape(num_layers, hidden_size)
+                # =================================================
+
             # ----- Construct the Transition -----
             transition = Transition(
                 state=current_state,
@@ -975,4 +1121,21 @@ def concatenate_batch_transitions(
                     left_info[key] = torch.cat([left_info[key], right_info[key]], dim=0)
                 else:
                     left_info[key] = right_info[key]
+
+    # 拼接序列初始隐藏态 [num_layers, B, H]，沿 batch 维(dim=1)拼接
+    left_hidden = left_batch_transitions.get("initial_hidden")
+    right_hidden = right_batch_transition.get("initial_hidden")
+    if left_hidden is not None and right_hidden is not None:
+        left_batch_transitions["initial_hidden"] = torch.cat([left_hidden, right_hidden], dim=1)
+    elif right_hidden is not None:
+        left_batch_transitions["initial_hidden"] = right_hidden
+
+    # 拼接下一状态初始隐藏态
+    left_next_hidden = left_batch_transitions.get("next_initial_hidden")
+    right_next_hidden = right_batch_transition.get("next_initial_hidden")
+    if left_next_hidden is not None and right_next_hidden is not None:
+        left_batch_transitions["next_initial_hidden"] = torch.cat([left_next_hidden, right_next_hidden], dim=1)
+    elif right_next_hidden is not None:
+        left_batch_transitions["next_initial_hidden"] = right_next_hidden
+
     return left_batch_transitions

@@ -13,7 +13,9 @@
 # limitations under the License.
 from __future__ import annotations
 
+import logging
 import math
+import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import asdict
 from typing import Any
@@ -49,6 +51,15 @@ class SACAlgorithm(RLAlgorithm):
     """
     config_class = SACAlgorithmConfig
     name = "sac"
+    # ===== 新增：optimization_step 可读写属性 =====
+    @property
+    def optimization_step(self) -> int:
+        return self._optimization_step
+
+    @optimization_step.setter
+    def optimization_step(self, value: int) -> None:
+        self._optimization_step = int(value)
+
 
     def __init__(
         self,
@@ -239,20 +250,27 @@ class SACAlgorithm(RLAlgorithm):
             stats.grad_norms["discrete_critic"] = dc_grad
 
         if self._optimization_step % self.config.policy_update_freq == 0:
-            for _ in range(self.config.policy_update_freq):
-                loss_actor = self._compute_loss_actor(fb)
+            loss_actor = self._compute_loss_actor(fb)
+            # 前置校验：损失值异常则直接跳过，不反向传播避免污染参数
+            if torch.isnan(loss_actor) or torch.isinf(loss_actor):
+                logging.warning("[WARNING] Actor损失出现NaN/Inf，跳过本次更新")
+                actor_grad = float('nan')
+            else:
                 self.optimizers["actor"].zero_grad()
                 loss_actor.backward()
-                actor_grad = torch.nn.utils.clip_grad_norm_(
-                    self.policy.actor.parameters(), max_norm=clip
-                ).item()
-                self.optimizers["actor"].step()
+                actor_grad = torch.nn.utils.clip_grad_norm_(self.policy.actor.parameters(), max_norm=clip).item()
+                if torch.isnan(torch.tensor(actor_grad)) or torch.isinf(torch.tensor(actor_grad)):
+                    logging.warning("[WARNING] Actor梯度出现NaN/Inf，跳过本次更新")
+                    self.optimizers["actor"].zero_grad()
+                else:
+                    self.optimizers["actor"].step()
 
-                loss_temp = self._compute_loss_temperature(fb)
-                self.optimizers["temperature"].zero_grad()
-                loss_temp.backward()
-                temp_grad = torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=clip).item()
-                self.optimizers["temperature"].step()
+
+            loss_temp = self._compute_loss_temperature(fb)
+            self.optimizers["temperature"].zero_grad()
+            loss_temp.backward()
+            temp_grad = torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=clip).item()
+            self.optimizers["temperature"].step()
 
             stats.losses["loss_actor"] = loss_actor.item()
             stats.losses["loss_temperature"] = loss_temp.item()
@@ -261,22 +279,28 @@ class SACAlgorithm(RLAlgorithm):
             stats.extra["temperature"] = self.temperature
 
         self._update_target_networks()
-        # ========== 新增：参数NaN早停检查 ==========
-        # 检查核心可训练参数，出现NaN立即终止训练，避免保存损坏权重
-        check_params = [
-            self.policy.actor.encoder.state_encoder[0].weight,
-            self.policy.actor.encoder.spatial_embeddings['observation_images_front'].kernel,
-            self.policy.actor.mean_layer.weight,
-        ]
-        for idx, param in enumerate(check_params):
-            if torch.isnan(param).any():
-                raise RuntimeError(
-                    f"[FATAL] 检测到参数NaN，训练终止！step={self._optimization_step}, "
-                    f"异常参数索引: {idx}"
-                )
-        # =============================================
+        # ========== 全量参数NaN/Inf检测（每100步执行一次，降低性能开销） ==========
+        if self._optimization_step % 100 == 0:
+            nan_params = []
+            # 检测Actor参数
+            for name, param in self.policy.named_parameters():
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    nan_params.append(f"policy.{name}")
+            # 检测Critic参数
+            for name, param in self.critic_ensemble.named_parameters():
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    nan_params.append(f"critic_ensemble.{name}")
+            # 检测温度参数
+            if torch.isnan(self.log_alpha).any() or torch.isinf(self.log_alpha).any():
+                nan_params.append("log_alpha")
+            if nan_params:
+                logging.critical(f"[FATAL] 检测到参数NaN/Inf，异常参数: {nan_params}")
+                raise RuntimeError(f"参数NaN检测失败，异常参数: {nan_params}")
+        
         self._optimization_step += 1
         return stats
+    
+
     @staticmethod
     def _slice_time_dim(data, start: int, end: int | None):
         """对张量/张量字典在第1维（时间维）切片，兼容None
@@ -297,118 +321,130 @@ class SACAlgorithm(RLAlgorithm):
         observations = batch["state"]
         actions = batch[ACTION]
         observation_features = batch.get("observation_feature")
-        
-        # ========== 提取序列初始隐藏态 ==========
-        initial_hidden = batch.get("initial_hidden", None)
-        next_initial_hidden = batch.get("next_initial_hidden", None)
-
-        # 提取Critic专用组件
         rewards = batch["reward"].squeeze(-1)  # [B] 或 [B, L]
         next_observations = batch["next_state"]
         done = batch["done"].squeeze(-1)
         next_observation_features = batch.get("next_observation_feature")
 
+        # ========== 序列预热与截断参数计算 ==========
+        if self.config.use_sequence:
+            seq_len = observations[next(iter(observations.keys()))].shape[1]
+            # 默认预热长度：序列长度1/4，至少5步，不超过序列一半
+            default_burn_in = max(5, min(seq_len // 4, seq_len // 2))
+            
+            if self.config.bptt_truncate_len is not None:
+                keep_len = min(self.config.bptt_truncate_len, seq_len)
+                burn_in_len = seq_len - keep_len
+                # 保证预热长度不低于默认值，不足则压缩有效段
+                if burn_in_len < default_burn_in:
+                    burn_in_len = default_burn_in
+                    keep_len = seq_len - burn_in_len
+            else:
+                # 非BPTT模式：拆分预热/有效段，预热段不回传梯度
+                burn_in_len = default_burn_in
+                keep_len = seq_len - burn_in_len
+
+            # 边界保护：序列过短时退化为全序列无预热，并告警
+            if keep_len <= 0:
+                burn_in_len = 0
+                keep_len = seq_len
+                if seq_len < default_burn_in:
+                    warnings.warn(
+                        f"序列长度({seq_len})小于最小预热长度({default_burn_in})，已退化为无预热全序列训练，时序建模效果可能下降。",
+                        UserWarning, stacklevel=2
+                    )
+        else:
+            burn_in_len = 0
+            keep_len = None
+
+        # ========== 计算Target Q值（无梯度，全序列计算后切片对齐） ==========
         with torch.no_grad():
+            # 统一时序起点：Actor与Target Critic均从零隐藏态开始
+            # 与当前Critic的预热逻辑完全对齐，消除Bellman目标系统性偏差
             next_action_preds, next_log_probs, _ = self.policy.actor(
                 next_observations,
                 next_observation_features,
                 mode="train",
-                hidden_in=next_initial_hidden,
+                hidden_in=None,
             )
-            # 计算target Q值
+            # Target Critic 全序列前向：与当前Critic使用相同的零初始态
             q_targets = self._critic_forward(
                 observations=next_observations,
                 actions=next_action_preds,
                 use_target=True,
                 observation_features=next_observation_features,
-                hidden_in=next_initial_hidden,
+                hidden_in=None,
             )
+
             if self.config.num_subsample_critics is not None:
                 indices = torch.randperm(self.config.num_critics)
                 indices = indices[: self.config.num_subsample_critics]
                 q_targets = q_targets[indices]
-            min_q, _ = q_targets.min(dim=0)
+            min_q_target, _ = q_targets.min(dim=0)
             if self.config.use_backup_entropy:
-                min_q = min_q - (self.temperature * next_log_probs)
-            # Bellman方程：完整序列目标值
-            td_target = rewards + (1 - done) * self.config.discount * min_q
+                min_q_target = min_q_target - (self.temperature * next_log_probs)
+            # Bellman目标值
+            td_target_full = rewards + (1 - done) * self.config.discount * min_q_target
 
-        # 计算当前预测Q值
+        # ========== 计算当前Critic Q值（梯度控制核心逻辑） ==========
         if self.policy_config.num_discrete_actions is not None:
             actions: Tensor = actions[..., :DISCRETE_DIMENSION_INDEX]
-        q_preds = self._critic_forward(
-            observations=observations,
-            actions=actions,
-            use_target=False,
-            observation_features=observation_features,
-            hidden_in=initial_hidden,
-        )
 
-        # ========== 标准BPTT截断：仅有效段回传梯度 ==========
-        if self.config.use_sequence and self.config.bptt_truncate_len is not None:
-            seq_len = rewards.shape[-1]
-            keep_len = min(self.config.bptt_truncate_len, seq_len)
-            burn_in_len = seq_len - keep_len
-
-            # 目标Q值在no_grad内，直接截取有效段
-            td_target_valid = td_target[:, burn_in_len:]
-
-            # 预热段前向得到截断点隐藏态，detach断开梯度
-            if burn_in_len > 0:
-                burn_obs = {k: v[:, :burn_in_len, ...] for k, v in observations.items()}
-                burn_actions = actions[:, :burn_in_len, ...]
-                # 修复：用辅助函数切片图像特征字典
-                burn_obs_feat = self._slice_time_dim(observation_features, 0, burn_in_len)
-
-                _, burn_hidden = self._critic_forward(
+        if self.config.use_sequence and burn_in_len > 0:
+            # --- 预热段：无梯度前向，构建初始上下文，提取截断点隐藏态 ---
+            burn_obs = {k: v[:, :burn_in_len, ...] for k, v in observations.items()}
+            burn_acts = actions[:, :burn_in_len, ...]
+            burn_obs_feat = self._slice_time_dim(observation_features, 0, burn_in_len)
+            
+            with torch.no_grad():
+                _, critic_burn_hidden = self._critic_forward(
                     observations=burn_obs,
-                    actions=burn_actions,
+                    actions=burn_acts,
                     use_target=False,
                     observation_features=burn_obs_feat,
-                    hidden_in=initial_hidden,
+                    hidden_in=None,
                     return_hidden=True,
                 )
-                # 核心：截断梯度
-                trunc_hidden = [h.detach() for h in burn_hidden]
-            else:
-                trunc_hidden = initial_hidden
+            # 预热隐藏态脱梯度，作为有效段初始状态
+            critic_trunc_hidden = [h.detach() for h in critic_burn_hidden]
 
-            # 有效段输入
+            # --- 有效段：带梯度前向，仅回传有效段梯度 ---
             valid_obs = {k: v[:, burn_in_len:, ...] for k, v in observations.items()}
-            valid_actions = actions[:, burn_in_len:, ...]
-            # 修复：用辅助函数切片图像特征字典
+            valid_acts = actions[:, burn_in_len:, ...]
             valid_obs_feat = self._slice_time_dim(observation_features, burn_in_len, None)
-
-            # 有效段前向
+            
             q_preds_valid = self._critic_forward(
                 observations=valid_obs,
-                actions=valid_actions,
+                actions=valid_acts,
                 use_target=False,
                 observation_features=valid_obs_feat,
-                hidden_in=trunc_hidden,
+                hidden_in=critic_trunc_hidden,
             )
-
-            # 计算有效段MSE损失
-            td_target_dup = einops.repeat(td_target_valid, "... -> e ...", e=q_preds_valid.shape[0])
-            critics_loss = (
-                F.mse_loss(
-                    input=q_preds_valid,
-                    target=td_target_dup,
-                    reduction="none",
-                ).mean(dim=tuple(range(1, q_preds_valid.ndim)))
-            ).sum()
+            # 截取对应有效段的Target值
+            td_target_valid = td_target_full[:, burn_in_len:]
         else:
-            # 全序列损失计算
-            td_target_dup = einops.repeat(td_target, "... -> e ...", e=q_preds.shape[0])
-            critics_loss = (
-                F.mse_loss(
-                    input=q_preds,
-                    target=td_target_dup,
-                    reduction="none",
-                ).mean(dim=tuple(range(1, q_preds.ndim)))
-            ).sum()
+            # 无预热/单步模式：全量前向
+            q_preds_valid = self._critic_forward(
+                observations=observations,
+                actions=actions,
+                use_target=False,
+                observation_features=observation_features,
+                hidden_in=None,
+            )
+            td_target_valid = td_target_full
+
+        # ========== 统一损失计算 ==========
+        td_target_dup = einops.repeat(td_target_valid, "... -> e ...", e=q_preds_valid.shape[0])
+        critics_loss = (
+            F.mse_loss(
+                input=q_preds_valid,
+                target=td_target_dup,
+                reduction="none",
+            ).mean(dim=tuple(range(1, q_preds_valid.ndim)))
+        ).sum()
 
         return critics_loss
+
 
     def _compute_loss_discrete_critic(self, batch: dict[str, Any]) -> Tensor:
         observations = batch["state"]
@@ -476,55 +512,123 @@ class SACAlgorithm(RLAlgorithm):
             keep_len = min(self.config.bptt_truncate_len, seq_len)
             burn_in_len = seq_len - keep_len
 
-            # 预热段：仅前向得到截断点隐藏态，断开梯度
+            # ========== Actor 侧：预热 + 截断（使用存储的初始隐藏态）==========
             if burn_in_len > 0:
+                # 预热段：前向得到截断点隐藏态，detach 断开梯度
                 burn_obs = {k: v[:, :burn_in_len, ...] for k, v in observations.items()}
-                # 修复：用辅助函数切片
                 burn_obs_feat = self._slice_time_dim(observation_features, 0, burn_in_len)
-
                 _, _, _, burn_hidden = self.policy.actor(
                     burn_obs, burn_obs_feat,
                     mode="train", hidden_in=initial_hidden,
                     return_hidden=True,
                 )
-                trunc_hidden = burn_hidden.detach()
+                actor_trunc_hidden = burn_hidden.detach()
             else:
-                trunc_hidden = initial_hidden
+                # 无预热则直接使用序列初始隐藏态
+                actor_trunc_hidden = initial_hidden
 
-            # 有效段：计算动作与对数概率
+            # 有效段：计算动作与对数概率（梯度仅在有效段回传）
             valid_obs = {k: v[:, burn_in_len:, ...] for k, v in observations.items()}
-            # 修复：用辅助函数切片
             valid_obs_feat = self._slice_time_dim(observation_features, burn_in_len, None)
-
             actions_pi, log_probs, _ = self.policy.actor(
                 valid_obs, valid_obs_feat,
-                mode="train", hidden_in=trunc_hidden,
+                mode="train", hidden_in=actor_trunc_hidden,
             )
 
-            # Critic同步使用有效段与截断隐藏态
+            # ========== Critic 侧：预热 + 截断（使用真实动作预热，对齐Critic训练分布）==========
+            if burn_in_len > 0:
+                critic_burn_obs = {k: v[:, :burn_in_len, ...] for k, v in observations.items()}
+                critic_burn_obs_feat = self._slice_time_dim(observation_features, 0, burn_in_len)
+                # 修复：使用真实动作预热Critic，而非策略生成动作，对齐Critic训练时的输入分布
+                critic_burn_actions = batch[ACTION][:, :burn_in_len, ...]
+                if self.policy_config.num_discrete_actions is not None:
+                    critic_burn_actions = critic_burn_actions[..., :DISCRETE_DIMENSION_INDEX]
+                
+                _, critic_burn_hidden = self._critic_forward(
+                    observations=critic_burn_obs,
+                    actions=critic_burn_actions,
+                    use_target=False,
+                    observation_features=critic_burn_obs_feat,
+                    hidden_in=None,
+                    return_hidden=True,
+                )
+                critic_trunc_hidden = [h.detach() for h in critic_burn_hidden]
+            else:
+                critic_trunc_hidden = None
+
+
+
+            # 有效段 Critic 前向
             q_preds = self._critic_forward(
                 observations=valid_obs,
                 actions=actions_pi,
                 use_target=False,
                 observation_features=valid_obs_feat,
-                hidden_in=trunc_hidden,
+                hidden_in=critic_trunc_hidden,
             )
             min_q_preds = q_preds.min(dim=0)[0]
             actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
         else:
-            # 原有全序列计算逻辑
+            # 全序列模式：统一预热规则，与Critic损失计算逻辑完全对齐
+            seq_len = observations[next(iter(observations.keys()))].shape[1]
+            default_burn_in = max(5, min(seq_len // 4, seq_len // 2))
+            burn_in_len = default_burn_in
+            keep_len = seq_len - burn_in_len
+            if keep_len <= 0:
+                burn_in_len = 0
+                keep_len = seq_len
+
+            # Actor侧：预热段无梯度构建上下文
+            if burn_in_len > 0:
+                burn_obs = {k: v[:, :burn_in_len, ...] for k, v in observations.items()}
+                burn_obs_feat = self._slice_time_dim(observation_features, 0, burn_in_len)
+                _, _, _, burn_hidden = self.policy.actor(
+                    burn_obs, burn_obs_feat,
+                    mode="train", hidden_in=None,
+                    return_hidden=True,
+                )
+                actor_trunc_hidden = burn_hidden.detach()
+            else:
+                actor_trunc_hidden = None
+
+            # Actor有效段前向
+            valid_obs = {k: v[:, burn_in_len:, ...] for k, v in observations.items()}
+            valid_obs_feat = self._slice_time_dim(observation_features, burn_in_len, None)
             actions_pi, log_probs, _ = self.policy.actor(
-                observations, observation_features, mode="train", hidden_in=initial_hidden
+                valid_obs, valid_obs_feat,
+                mode="train", hidden_in=actor_trunc_hidden,
             )
+
+            # Critic侧：用真实动作预热，与Critic损失计算分布一致
+            if burn_in_len > 0:
+                critic_burn_obs = {k: v[:, :burn_in_len, ...] for k, v in observations.items()}
+                critic_burn_obs_feat = self._slice_time_dim(observation_features, 0, burn_in_len)
+                critic_burn_actions = batch[ACTION][:, :burn_in_len, ...]
+                _, critic_burn_hidden = self._critic_forward(
+                    observations=critic_burn_obs,
+                    actions=critic_burn_actions,
+                    use_target=False,
+                    observation_features=critic_burn_obs_feat,
+                    hidden_in=None,
+                    return_hidden=True,
+                )
+                critic_trunc_hidden = [h.detach() for h in critic_burn_hidden]
+            else:
+                critic_trunc_hidden = None
+
+            # Critic有效段前向
             q_preds = self._critic_forward(
-                observations=observations, actions=actions_pi,
-                use_target=False, observation_features=observation_features,
-                hidden_in=initial_hidden,
+                observations=valid_obs,
+                actions=actions_pi,
+                use_target=False,
+                observation_features=valid_obs_feat,
+                hidden_in=critic_trunc_hidden,
             )
             min_q_preds = q_preds.min(dim=0)[0]
             actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
 
         return actor_loss
+
 
 
     # ======================================================
@@ -540,14 +644,23 @@ class SACAlgorithm(RLAlgorithm):
                 keep_len = min(self.config.bptt_truncate_len, seq_len)
                 burn_in_len = seq_len - keep_len
 
-                # 只取有效段计算log_probs
-                valid_obs = {k: v[:, burn_in_len:, ...] for k, v in observations.items()}
-                # 修复：用辅助函数切片
-                valid_obs_feat = self._slice_time_dim(observation_features, burn_in_len, None)
+                if burn_in_len > 0:
+                    burn_obs = {k: v[:, :burn_in_len, ...] for k, v in observations.items()}
+                    burn_obs_feat = self._slice_time_dim(observation_features, 0, burn_in_len)
+                    _, _, _, burn_hidden = self.policy.actor(
+                        burn_obs, burn_obs_feat,
+                        mode="train", hidden_in=initial_hidden,
+                        return_hidden=True,
+                    )
+                    trunc_hidden = burn_hidden.detach()
+                else:
+                    trunc_hidden = initial_hidden
 
+                valid_obs = {k: v[:, burn_in_len:, ...] for k, v in observations.items()}
+                valid_obs_feat = self._slice_time_dim(observation_features, burn_in_len, None)
                 _, log_probs, _ = self.policy.actor(
                     valid_obs, valid_obs_feat,
-                    mode="train", hidden_in=initial_hidden,
+                    mode="train", hidden_in=trunc_hidden,
                 )
             else:
                 _, log_probs, _ = self.policy.actor(
@@ -557,6 +670,7 @@ class SACAlgorithm(RLAlgorithm):
 
         temperature_loss = (-self.log_alpha.exp() * (log_probs + self.target_entropy)).mean()
         return temperature_loss
+
 
 
 
@@ -596,6 +710,9 @@ class SACAlgorithm(RLAlgorithm):
             "done": batch["done"],
             "observation_feature": observation_features,
             "next_observation_feature": next_observation_features,
+            # 透传序列初始隐藏态，供 Actor 时序网络使用
+            "initial_hidden": batch.get("initial_hidden"),
+            "next_initial_hidden": batch.get("next_initial_hidden"),
         }
         if include_complementary_info and "complementary_info" in batch:
             forward_batch["complementary_info"] = batch["complementary_info"]
@@ -668,7 +785,7 @@ class SACAlgorithm(RLAlgorithm):
         # =================================================
         
         # 使用映射后的权重加载，strict=True 可验证是否完全匹配
-        self.policy.actor.load_state_dict(remapped_actor_sd, strict=False)
+        self.policy.actor.load_state_dict(remapped_actor_sd, strict=True)
         
         # 同步加载 critic 侧编码器权重（shared_encoder=False 时生效）
         if "policy" in weights and not self.policy_config.shared_encoder:
@@ -678,7 +795,7 @@ class SACAlgorithm(RLAlgorithm):
                     new_key = key.replace("encoder_critic.", "", 1)
                     critic_enc_sd[new_key] = value
             if critic_enc_sd:
-                self.policy.encoder_critic.load_state_dict(critic_enc_sd, strict=False)
+                self.policy.encoder_critic.load_state_dict(critic_enc_sd, strict=True)
 
         if "discrete_critic" in weights and self.policy.discrete_critic is not None:
             discrete_sd = move_state_dict_to_device(weights["discrete_critic"], device=device)
@@ -788,9 +905,18 @@ class CriticHead(nn.Module):
                 dropout=gru_dropout,
             )
             # 正交初始化GRU权重，提升初始数值稳定性
+            # 权重正交初始化 + 偏置分段初始化
             for name, param in self.gru.named_parameters():
                 if 'weight' in name:
-                    nn.init.orthogonal_(param, gain=0.5)
+                    nn.init.orthogonal_(param, gain=1.0)
+                elif 'bias' in name:
+                    # GRU 偏置按 [重置门r, 更新门z, 候选状态n] 三段拼接
+                    bias_size = param.shape[0]
+                    n = bias_size // 3
+                    nn.init.constant_(param[:n], 1.0)      # 重置门偏置为正，提升梯度流通
+                    nn.init.constant_(param[n:2*n], 0.0)   # 更新门偏置为0，初始保留历史信息
+                    nn.init.constant_(param[2*n:], 0.0)    # 候选状态偏置为0
+
             mlp_input_dim = gru_hidden_size
         else:
             self.gru = None
@@ -867,12 +993,15 @@ class CriticEnsemble(nn.Module):
         observations = {k: v.to(device) for k, v in observations.items()}
         obs_enc = self.encoder(observations, cache=observation_features)
         inputs = torch.cat([obs_enc, actions], dim=-1)
-
         q_values = []
         hidden_states = []
+
+        # 修复：单张量输入时，为每个Critic Head复制独立副本，避免共享隐藏态
+        if hidden_in is not None and not isinstance(hidden_in, list):
+            hidden_in = [hidden_in.clone() for _ in range(len(self.critics))]
+
         for i, critic in enumerate(self.critics):
-            # 兼容单张量共享 / 列表逐head分配两种模式
-            curr_hidden = hidden_in[i] if isinstance(hidden_in, list) else hidden_in
+            curr_hidden = hidden_in[i] if hidden_in is not None else None
             
             if return_hidden:
                 q, h = critic(inputs, hidden_in=curr_hidden, return_hidden=True)
@@ -880,7 +1009,7 @@ class CriticEnsemble(nn.Module):
                 hidden_states.append(h)
             else:
                 q_values.append(critic(inputs, hidden_in=curr_hidden))
-
+        
         q_values = torch.stack(q_values, dim=0)
         if return_hidden:
             return q_values, hidden_states

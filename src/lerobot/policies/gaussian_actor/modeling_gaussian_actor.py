@@ -27,86 +27,6 @@ DISCRETE_DIMENSION_INDEX = -1  # Gripper is always the last dimension
 import math
 from typing import Optional
 
-class NanInfTracker:
-    """分层 NaN/Inf 异常追踪器
-    支持按模块统计异常数量与占比，超过阈值触发告警，避免过度兜底掩盖问题
-    """
-    def __init__(
-        self,
-        warn_threshold: int = 1,          # 单步异常数≥该值触发告警
-        warn_ratio: float = 0.0,         # 异常占比≥该值触发告警（0表示不按占比触发）
-        summary_steps: int = 100,        # 每N步打印一次汇总统计
-        module_name: str = "module",
-        enable: bool = True,
-    ):
-        self.module_name = module_name
-        self.warn_threshold = warn_threshold
-        self.warn_ratio = warn_ratio
-        self.summary_steps = summary_steps
-        self.enable = enable
-
-        # 累积统计
-        self.step_count = 0
-        self.total_nan = 0
-        self.total_inf = 0
-        self.abnormal_steps = 0  # 出现过异常的步数
-
-    def track(self, tensor: Tensor, desc: str = "") -> tuple[int, int]:
-        """统计张量中的 NaN 和 Inf 数量，触发阈值则告警
-        返回: (nan_count, inf_count)
-        """
-        if not self.enable or tensor is None:
-            return 0, 0
-
-        nan_count = int(torch.isnan(tensor).sum().item())
-        inf_count = int(torch.isinf(tensor).sum().item())
-        total_elem = tensor.numel()
-
-        if nan_count > 0 or inf_count > 0:
-            self.total_nan += nan_count
-            self.total_inf += inf_count
-            self.abnormal_steps += 1
-
-            # 单步阈值告警
-            total_abnormal = nan_count + inf_count
-            ratio = total_abnormal / total_elem if total_elem > 0 else 0.0
-            hit_threshold = total_abnormal >= self.warn_threshold
-            hit_ratio = self.warn_ratio > 0 and ratio >= self.warn_ratio
-
-            if hit_threshold or hit_ratio:
-                print(
-                    f"[WARNING][{self.module_name}] {desc} | "
-                    f"NaN={nan_count}, Inf={inf_count}, "
-                    f"占比={ratio:.4%}, 张量shape={list(tensor.shape)}"
-                )
-
-        self.step_count += 1
-
-        # 周期性汇总
-        if self.summary_steps > 0 and self.step_count % self.summary_steps == 0:
-            self._print_summary()
-
-        return nan_count, inf_count
-
-    def _print_summary(self):
-        if self.abnormal_steps == 0:
-            return
-        print(
-            f"[SUMMARY][{self.module_name}] 近{self.summary_steps}步汇总 | "
-            f"异常步数={self.abnormal_steps}, 累计NaN={self.total_nan}, "
-            f"累计Inf={self.total_inf}"
-        )
-        # 重置周期统计
-        self.total_nan = 0
-        self.total_inf = 0
-        self.abnormal_steps = 0
-
-    def reset(self):
-        self.step_count = 0
-        self.total_nan = 0
-        self.total_inf = 0
-        self.abnormal_steps = 0
-
 
 class GaussianActorPolicy(
     PreTrainedPolicy,
@@ -159,25 +79,7 @@ class GaussianActorPolicy(
         Maintains internal GRU hidden state across timesteps. Call reset() at episode start.
         接口签名与原版完全一致，GRU模式下内部自动维护隐藏态
         """
-        # ===== 初始化观测异常追踪器（首次调用创建）=====
-        if not hasattr(self, "_obs_tracker"):
-            self._obs_tracker = NanInfTracker(
-                module_name="ObsInput",
-                warn_threshold=1,
-                summary_steps=500,  # 推理侧步数多，降低汇总频率
-            )
-        # print("=== 观测输入校验 ===")
-        # for k, v in batch.items():
-        #     if isinstance(v, torch.Tensor):
-        #         print(f"{k}: shape={list(v.shape)}, min={v.min():.4f}, max={v.max():.4f}, mean={v.mean():.4f}")
-                # ===== 新增：观测NaN清洗 =====
-        # ===== 新增：先统计异常，再兜底 =====
-        for key in batch:
-            if isinstance(batch[key], torch.Tensor) and torch.isnan(batch[key]).any():
-                self._obs_tracker.track(batch[key], desc=f"key={key}")
-                # 原有兜底逻辑保留
-                batch[key] = torch.nan_to_num(batch[key], nan=0.0, posinf=1e3, neginf=-1e3)
-        # ==========================================
+
         observations_features = None
         if self.shared_encoder and self.actor.encoder.has_images:
             observations_features = self.actor.encoder.get_cached_image_features(batch)
@@ -254,22 +156,31 @@ class GaussianActorPolicy(
             return
         self.actor.update_hidden(batch)
 
-    def load_state_dict(self, state_dict, strict=True):
+    def load_state_dict(self, state_dict, strict=False):
         # 旧版键名自动映射兼容
         remapped = {}
         for k, v in state_dict.items():
             if k.startswith("encoder_actor."):
-                # 旧版顶层actor编码器 -> 映射到actor模块内部的encoder
                 new_key = k.replace("encoder_actor.", "actor.encoder.", 1)
                 remapped[new_key] = v
             elif k.startswith("encoder_critic."):
-                # 旧版顶层critic编码器 -> 映射到当前顶层encoder_critic
-                new_key = k.replace("encoder_critic.", "encoder_critic.", 1)
+                new_key = k.replace("encoder_critic.", "", 1)
                 remapped[new_key] = v
             else:
                 remapped[k] = v
         
-        return super().load_state_dict(remapped, strict=strict)
+        missing_keys, unexpected_keys = super().load_state_dict(remapped, strict=strict)
+        # GRU参数缺失属于正常兼容场景，仅提示不告警
+        gru_missing = [k for k in missing_keys if "gru" in k]
+        other_missing = [k for k in missing_keys if "gru" not in k]
+        if gru_missing:
+            logging.info(f"检测到旧版无GRU权重，已自动兼容，缺失GRU参数共{len(gru_missing)}个")
+        if other_missing:
+            logging.warning(f"加载权重存在非预期缺失键：{other_missing[:5]}")
+        if unexpected_keys:
+            logging.warning(f"加载权重存在多余键：{unexpected_keys[:5]}")
+        return missing_keys, unexpected_keys
+
 
 class GaussianActorObservationEncoder(nn.Module):
     """Encode image and/or state vector observations.
@@ -281,13 +192,7 @@ class GaussianActorObservationEncoder(nn.Module):
         self._init_image_layers()
         self._init_state_layers()
         self._compute_output_dim()
-        # ===== 新增：编码器输出异常追踪器 =====
-        self.output_tracker = NanInfTracker(
-            module_name="Encoder",
-            warn_threshold=1,
-            warn_ratio=0.01,  # 异常元素占比超1%告警
-            summary_steps=100,
-        )
+
 
     def _init_image_layers(self) -> None:
         self.image_keys = [k for k in self.config.input_features if is_image_feature(k)]
@@ -354,60 +259,74 @@ class GaussianActorObservationEncoder(nn.Module):
     def forward(
         self, obs: dict[str, Tensor], cache: dict[str, Tensor] | None = None, detach: bool = False
     ) -> Tensor:
-        # 保留原有维度检测、flatten 逻辑
-        has_seq_dim = False
+        # ========== 【修复】统一校验所有可用观测的序列维度一致性 ==========
+        has_seq_dim = None
         batch_shape = None
+
+        # 1. 收集所有存在的观测键与对应维度约定
+        check_pairs = []
+        if self.has_images:
+            for key in self.image_keys:
+                if key in obs:
+                    check_pairs.append((key, 5))  # 图像带序列维时为 5 维 [B,L,C,H,W]
+        if self.has_env and OBS_ENV_STATE in obs:
+            check_pairs.append((OBS_ENV_STATE, 3))  # 状态带序列维时为 3 维 [B,L,D]
         if self.has_state and OBS_STATE in obs:
-            has_seq_dim = obs[OBS_STATE].ndim == 3
-        elif self.has_env and OBS_ENV_STATE in obs:
-            has_seq_dim = obs[OBS_ENV_STATE].ndim == 3
-        elif self.has_images:
-            first_key = self.image_keys[0]
-            has_seq_dim = obs[first_key].ndim == 5
+            check_pairs.append((OBS_STATE, 3))
+
+        # 2. 遍历校验所有观测维度是否一致
+        for key, expected_seq_ndim in check_pairs:
+            cur_ndim = obs[key].ndim
+            cur_has_seq = cur_ndim == expected_seq_ndim
+            if has_seq_dim is None:
+                has_seq_dim = cur_has_seq
+            elif has_seq_dim != cur_has_seq:
+                raise ValueError(
+                    f"观测维度不一致：{key} 的 ndim={cur_ndim}，"
+                    f"是否带序列维={cur_has_seq}，与其他观测不匹配。请确保所有输入同时带/不带时间维度。"
+                )
+
+        # 兜底：无任何观测时默认无序列维
+        if has_seq_dim is None:
+            has_seq_dim = False
+
+        # 3. 序列模式：合并 batch 与时间维度
         if has_seq_dim:
-            batch_size, seq_len = obs[next(iter(obs.keys()))].shape[:2]
+            first_key = next(iter(obs.keys()))
+            batch_size, seq_len = obs[first_key].shape[:2]
             batch_shape = (batch_size, seq_len)
             obs = self._flatten_seq_dim(obs)
             if cache is not None:
                 cache = {k: v.flatten(0, 1) for k, v in cache.items()}
 
+        # ========== 以下原有编码逻辑保持不变 ==========
         parts = []
         if self.has_images:
             if cache is None:
                 cache = self.get_cached_image_features(obs)
-            
-            # 新增：打印图像编码器原始输出
-            first_img_feat = next(iter(cache.values()))
-            #print(f"[编码器调试] ResNet原始输出 | min={first_img_feat.min():.4f} max={first_img_feat.max():.4f} mean={first_img_feat.mean():.4f}")
-            
             image_feat = self._encode_images(cache, detach)
-            #print(f"[编码器调试] 图像后处理输出 | min={image_feat.min():.4f} max={image_feat.max():.4f} mean={image_feat.mean():.4f}")
             parts.append(image_feat)
         
         if self.has_env:
             parts.append(self.env_encoder(obs[OBS_ENV_STATE]))
         if self.has_state:
             state_feat = self.state_encoder(obs[OBS_STATE])
-            #print(f"[编码器调试] 状态编码器输出 | min={state_feat.min():.4f} max={state_feat.max():.4f} mean={state_feat.mean():.4f}")
             parts.append(state_feat)
         
         if parts:
             out = torch.cat(parts, dim=-1)
         else:
             raise ValueError("No parts to concatenate")
-        # ===== 新增：先统计异常，再执行兜底 =====
-        self.output_tracker.track(out, desc="encoder_concat_output")
-        
-        # 原有兜底逻辑保留
+
+        # 数值兜底
         out = torch.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0)
         out = torch.clamp(out, -50.0, 50.0)
-        # ======================================
-        #print(f"[编码器调试] 最终拼接输出 | min={out.min():.4f} max={out.max():.4f} mean={out.mean():.4f}")
-        
+
         # 恢复序列维度
         if has_seq_dim and batch_shape is not None:
             out = out.view(*batch_shape, -1)
         return out
+
 
 
     # 【GRU改造新增】辅助方法：合并batch与seq维度
@@ -519,6 +438,7 @@ class MLP(nn.Module):
                 layers.append(act)
             in_dim = out_dim
         self.net = nn.Sequential(*layers)
+        self.output_dim = hidden_dims[-1]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -588,6 +508,7 @@ class Policy(nn.Module):
         gru_hidden_size: int = 64,
         num_gru_layers: int = 2,
         gru_dropout: float = 0.1,
+        gripper_std_max: float | None = None,  # None表示不限制
     ):
         super().__init__()
         self.encoder: GaussianActorObservationEncoder = encoder
@@ -614,9 +535,17 @@ class Policy(nn.Module):
                 dropout=gru_dropout,
             )
             # 正交初始化GRU权重，提升初始数值稳定性
+            # 权重正交初始化 + 偏置分段初始化
             for name, param in self.gru.named_parameters():
                 if 'weight' in name:
-                    nn.init.orthogonal_(param, gain=0.5)
+                    nn.init.orthogonal_(param, gain=1.0)
+                elif 'bias' in name:
+                    # GRU 偏置按 [重置门r, 更新门z, 候选状态n] 三段拼接
+                    bias_size = param.shape[0]
+                    n = bias_size // 3
+                    nn.init.constant_(param[:n], 1.0)      # 重置门偏置为正，提升梯度流通
+                    nn.init.constant_(param[n:2*n], 0.0)   # 更新门偏置为0，初始保留历史信息
+                    nn.init.constant_(param[2*n:], 0.0)    # 候选状态偏置为0
             mlp_input_dim = gru_hidden_size
         else:
             self.gru = None
@@ -647,13 +576,18 @@ class Policy(nn.Module):
                 nn.init.uniform_(self.std_layer.bias, -init_final, init_final)
             else:
                 orthogonal_init()(self.std_layer.weight)
-        # ===== 新增：分层异常追踪器 =====
-        self.enc_out_tracker = NanInfTracker(module_name="Policy-EncOut", warn_threshold=1, summary_steps=100)
-        self.gru_in_tracker = NanInfTracker(module_name="Policy-GRUIn", warn_threshold=1, summary_steps=100)
-        self.gru_out_tracker = NanInfTracker(module_name="Policy-GRUOut", warn_threshold=1, summary_steps=100)
-        self.hidden_tracker = NanInfTracker(module_name="Policy-Hidden", warn_threshold=1, summary_steps=100)
-        self.action_head_tracker = NanInfTracker(module_name="Policy-ActionHead", warn_threshold=1, summary_steps=100)
+        self.gripper_std_max = gripper_std_max
+    @property
+    def hidden_state(self) -> Tensor | None:
+        """获取当前推理模式下的GRU隐藏态"""
+        return self._hidden_state
 
+    @hidden_state.setter
+    def hidden_state(self, value: Tensor) -> None:
+        """设置GRU隐藏态，用于干预、权重更新等外部场景"""
+        if not self.use_gru:
+            return
+        self._hidden_state = value
 
     def reset_hidden(self, batch_size: int = 1):
         """Reset GRU hidden state to zero. Called at episode start for inference.
@@ -681,7 +615,7 @@ class Policy(nn.Module):
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
         # 编码器输出数值兜底：过滤NaN/Inf，限制范围
         # ===== 新增：编码器输出异常统计 =====
-        self.enc_out_tracker.track(obs_enc, desc=f"mode={mode}")
+        #self.enc_out_tracker.track(obs_enc, desc=f"mode={mode}")
         obs_enc = torch.nan_to_num(obs_enc, nan=0.0, posinf=10.0, neginf=-10.0)
 
         #print(f"[逐层调试] 编码器输出 | min={obs_enc.min():.4f} max={obs_enc.max():.4f} mean={obs_enc.mean():.4f}")
@@ -693,35 +627,35 @@ class Policy(nn.Module):
                     setattr(self, '_flattened', True)
                 init_hidden = hidden_in if hidden_in is not None else None
                 # 训练模式：GRU输入统计
-                self.gru_in_tracker.track(obs_enc, desc="train_input")
+                #self.gru_in_tracker.track(obs_enc, desc="train_input")
                 gru_out, hidden_out = self.gru(obs_enc, init_hidden)
                 
                 # 训练模式：GRU输出与隐藏态统计
-                self.gru_out_tracker.track(gru_out, desc="train_output")
-                self.hidden_tracker.track(hidden_out, desc="train_hidden")
+                #self.gru_out_tracker.track(gru_out, desc="train_output")
+                #self.hidden_tracker.track(hidden_out, desc="train_hidden")
                 net_in = gru_out
             elif mode == "inference":
                 # 隐藏态异常时自动重置
                 # 隐藏态异常检测保留并增强
-                if self._hidden_state is not None:
-                    self.hidden_tracker.track(self._hidden_state, desc="inference_hidden_before")
-                    if torch.isnan(self._hidden_state).any() or torch.isinf(self._hidden_state).any():
-                        print("[WARNING] GRU hidden state has NaN/Inf, resetting...")
-                        self.reset_hidden(batch_size=obs_enc.shape[0])
+                # if self._hidden_state is not None:
+                #     self.hidden_tracker.track(self._hidden_state, desc="inference_hidden_before")
+                #     if torch.isnan(self._hidden_state).any() or torch.isinf(self._hidden_state).any():
+                #         print("[WARNING] GRU hidden state has NaN/Inf, resetting...")
+                #         self.reset_hidden(batch_size=obs_enc.shape[0])
 
-                # 新增：打印隐藏态与输入特征的范数，判断是否坍缩
-                #print(f"[GRU调试] 输入特征范数: {obs_enc.norm().item():.4f}")
-                #print(f"[GRU调试] 隐藏态范数: {self._hidden_state.norm().item():.4f}")
-                # ========== 新增：GRU 输入统计 ==========
-                self.gru_in_tracker.track(obs_enc, desc="inference_input")
+                # # 新增：打印隐藏态与输入特征的范数，判断是否坍缩
+                # #print(f"[GRU调试] 输入特征范数: {obs_enc.norm():.4f}")
+                # #print(f"[GRU调试] 隐藏态范数: {self._hidden_state.norm():.4f}")
+                # # ========== 新增：GRU 输入统计 ==========
+                # self.gru_in_tracker.track(obs_enc, desc="inference_input")
                 # ============================================================
                 obs_enc = obs_enc.unsqueeze(1)  # [B, 1, D]
                 gru_out, new_hidden = self.gru(obs_enc, self._hidden_state)
                 # 新增：打印GRU输出范数
-                #print(f"[GRU调试] GRU输出范数: {gru_out.norm().item():.4f}")
+                #print(f"[GRU调试] GRU输出范数: {gru_out.norm():.4f}")
                 # GRU 输出与新隐藏态统计
-                self.gru_out_tracker.track(gru_out, desc="inference_output")
-                self.hidden_tracker.track(new_hidden, desc="inference_hidden_after")
+                # self.gru_out_tracker.track(gru_out, desc="inference_output")
+                # self.hidden_tracker.track(new_hidden, desc="inference_hidden_after")
                 # ========== 新增：NaN/Inf 二次校验，异常则用零替换 ==========
                 new_hidden = torch.nan_to_num(new_hidden, nan=0.0, posinf=20.0, neginf=-20.0)
                 gru_out = torch.nan_to_num(gru_out, nan=0.0, posinf=20.0, neginf=-20.0)
@@ -741,30 +675,42 @@ class Policy(nn.Module):
         #print(f"[调试] MLP输出 | min={outputs.min():.4f} max={outputs.max():.4f} mean={outputs.mean():.4f}")
         # 新增：MLP输出数值裁剪
         # 新增：MLP输出异常统计
-        self.action_head_tracker.track(outputs, desc="mlp_output")
+        #self.action_head_tracker.track(outputs, desc="mlp_output")
         
         means = self.mean_layer(outputs)
         #print(f"[调试] 动作均值 | min={means.min():.4f} max={means.max():.4f} mean={means.mean():.4f}")
         # 均值裁剪到合理动作范围，避免输出极端动作导致环境发散
-        self.action_head_tracker.track(means, desc="action_mean")
+        #self.action_head_tracker.track(means, desc="action_mean")
 
         # 计算标准差
         if self.fixed_std is None:
             log_std = self.std_layer(outputs)
-            self.action_head_tracker.track(log_std, desc="log_std")
+            #self.action_head_tracker.track(log_std, desc="log_std")
             std = torch.exp(log_std)
             # 在原始空间做范围限制，与配置参数语义完全对齐
             std = torch.clamp(std, self.std_min, self.std_max)
             # ========== 新增：单独限制夹爪维度的标准差上限 ==========
             # 夹爪为第4维（索引3），降低其探索噪声，抑制随机开合
-            GRIPPER_DIM_IDX = 3
-            MAX_GRIPPER_STD = 0.1  # 归一化空间下的最大标准差，越小越稳定
-            std[..., GRIPPER_DIM_IDX] = torch.clamp(std[..., GRIPPER_DIM_IDX], max=MAX_GRIPPER_STD)
+            # 修改后
+            # 连续动作的最后一维为夹爪维度，动态推导
+            # ========== 替换后（非原地，保留完整计算图）==========
+            # 仅当配置了夹爪标准差上限时才执行裁剪
+            if self.gripper_std_max is not None and self.action_dim > 0:
+                gripper_dim_idx = self.action_dim - 1
+                std_other = std[..., :gripper_dim_idx]
+                std_gripper = std[..., gripper_dim_idx:]
+                std_gripper = torch.clamp(std_gripper, max=self.gripper_std_max)
+                std = torch.cat([std_other, std_gripper], dim=-1)
         else:
             std = self.fixed_std.expand_as(means)
-
-        # 构建tanh压缩的高斯分布
-        dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
+        # 分布输入异常统计（复用动作头追踪器，长效累积）
+        # self.action_head_tracker.track(means, desc="dist_loc")
+        # self.action_head_tracker.track(std, desc="dist_scale")
+        # 构建高斯分布：根据开关决定是否启用tanh压缩
+        if self.use_tanh_squash:
+            dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
+        else:
+            dist = Independent(Normal(loc=means, scale=std), reinterpreted_batch_ndims=1)
         actions = dist.rsample()  # 重参数化采样
         log_probs = dist.log_prob(actions)
 
@@ -785,29 +731,29 @@ class Policy(nn.Module):
     def update_hidden(self, observations: dict[str, Tensor]) -> None:
         """
         仅更新 GRU 隐藏态，不输出动作。
-        用于人类干预、外部状态同步等场景，保证隐藏态与真实轨迹对齐。
-        Args:
-            observations: 经过归一化预处理的观测字典，与 select_action 输入格式一致
+        数值处理与推理模式完全一致，保证隐藏态分布对齐。
         """
         if not self.use_gru:
             return
         
-        # 与推理模式完全一致的编码流程，保证数值分布对齐
+        # 与推理路径完全一致的编码 + 数值兜底
         obs_enc = self.encoder(observations, detach=self.encoder_is_shared)
         obs_enc = torch.nan_to_num(obs_enc, nan=0.0, posinf=10.0, neginf=-10.0)
-        obs_enc = torch.clamp(obs_enc, -100.0, 100.0)
 
-        # 隐藏态异常自动重置
+        # 隐藏态异常自动重置（与推理路径一致）
         if self._hidden_state is not None and (torch.isnan(self._hidden_state).any() or torch.isinf(self._hidden_state).any()):
             self.reset_hidden(batch_size=obs_enc.shape[0])
         if self._hidden_state is None:
             self.reset_hidden(batch_size=obs_enc.shape[0])
 
-        # 单步 GRU 前向，只更新隐藏态，不后续计算动作
+        # 单步 GRU 前向，与推理路径处理完全一致
         obs_enc = obs_enc.unsqueeze(1)
         _, new_hidden = self.gru(obs_enc, self._hidden_state)
-        new_hidden = torch.clamp(new_hidden, -50.0, 50.0)
+        
+        # 与推理路径对齐的 NaN/Inf 兜底，不额外强裁剪
+        new_hidden = torch.nan_to_num(new_hidden, nan=0.0, posinf=20.0, neginf=-20.0)
         self._hidden_state = new_hidden
+
 
 
 class DefaultImageEncoder(nn.Module):
@@ -946,31 +892,44 @@ class RescaleFromTanh(Transform):
 
 class TanhMultivariateNormalDiag(TransformedDistribution):
     def __init__(self, loc, scale_diag, low=None, high=None):
-        # ===== 新增：分布输入异常统计 =====
-        # 首次调用创建追踪器实例（类级别共享）
-        if not hasattr(TanhMultivariateNormalDiag, "_tracker"):
-            TanhMultivariateNormalDiag._tracker = NanInfTracker(
-                module_name="TanhNormalDist",
-                warn_threshold=1,
-                warn_ratio=0.005,
-                summary_steps=200,
-            )
-        TanhMultivariateNormalDiag._tracker.track(loc, desc="loc_input")
-        TanhMultivariateNormalDiag._tracker.track(scale_diag, desc="scale_input")
-        # =================================
-        # 数值兜底：过滤NaN/Inf，保证标准差严格为正
-        loc = torch.nan_to_num(loc, nan=0.0, posinf=1.0, neginf=-1.0)
-        scale_diag = torch.nan_to_num(scale_diag, nan=1e-2, posinf=1.0, neginf=1e-2)
+        # 仅做 NaN/Inf 兜底，不截断分布均值，保证熵与 log_prob 计算准确
+        loc = torch.nan_to_num(loc, nan=0.0)
+        scale_diag = torch.nan_to_num(scale_diag, nan=1e-2)
         scale_diag = torch.clamp_min(scale_diag, 1e-4)
         
-        # 对角高斯用Independent+Normal，无矩阵分解，数值更稳定
         base_dist = Independent(Normal(loc=loc, scale=scale_diag), reinterpreted_batch_ndims=1)
-        transforms = [TanhTransform(cache_size=1)]
+        transforms = [TanhTransform(cache_size=0)]  # 关闭缓存避免数值累积误差
         if low is not None and high is not None:
             low = torch.as_tensor(low)
             high = torch.as_tensor(high)
             transforms.insert(0, RescaleFromTanh(low, high))
         super().__init__(base_dist, transforms)
+
+    def log_prob(self, value):
+        """数值稳定实现：用cosh公式替代1-tanh²，避免饱和时出现-inf"""
+        # 逆变换回高斯空间
+        x = value
+        for transform in reversed(self.transforms):
+            x = transform.inv(x)
+        
+        # 基础高斯对数概率
+        base_log_prob = self.base_dist.log_prob(x)
+        
+        # 数值稳定计算Tanh雅可比行列式：log(1-tanh²x) = -2*log(coshx)
+        tanh_jacobian = -2.0 * torch.log(torch.cosh(x) + 1e-8)
+        tanh_jacobian = tanh_jacobian.sum(dim=-1)
+        
+        # 缩放变换雅可比（如有）
+        rescale_log_det = 0.0
+        for transform in self.transforms:
+            if isinstance(transform, RescaleFromTanh):
+                rescale_log_det = transform.log_abs_det_jacobian(x, value)
+                break
+        
+        return base_log_prob + tanh_jacobian + rescale_log_det
+
+
+
 
     def mode(self):
         x = self.base_dist.base_dist.mean
@@ -978,9 +937,17 @@ class TanhMultivariateNormalDiag(TransformedDistribution):
             x = transform(x)
         return x
 
-    def stddev(self):
-        std = self.base_dist.base_dist.stddev
-        x = std
+    def stddev(self, num_samples: int = 10000):
+        """
+        Tanh变换后的分布无解析标准差，通过采样近似计算。
+        Args:
+            num_samples: 采样数量，越大精度越高
+        """
+        # 从基础高斯分布采样
+        samples = self.base_dist.sample(torch.Size([num_samples]))
+        # 执行全部变换（tanh + 缩放）
         for transform in self.transforms:
-            x = transform(x)
-        return x
+            samples = transform(samples)
+        # 样本标准差
+        return samples.std(dim=0)
+

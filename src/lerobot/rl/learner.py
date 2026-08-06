@@ -413,6 +413,7 @@ def add_actor_information_and_train(
 
         # Wait until the replay buffer has enough samples to start training
         if len(replay_buffer) < online_step_before_learning:
+            time.sleep(0.01)
             continue
 
         time_for_one_optimization_step = time.time()
@@ -803,7 +804,13 @@ def initialize_replay_buffer(
     # ========== 【GRU 改造新增】从算法配置读取序列参数，兼容旧配置 ==========
     use_sequence = getattr(cfg.algorithm, "use_sequence", False)
     seq_len = getattr(cfg.algorithm, "seq_len", 32)
-
+    # 新增：读取GRU配置，构造隐藏态形状
+    store_hidden = use_sequence and getattr(cfg.policy, "use_gru", False)
+    hidden_shape = None
+    if store_hidden:
+        num_layers = getattr(cfg.policy, "num_gru_layers", 2)
+        hidden_size = getattr(cfg.policy, "gru_hidden_size", 64)
+        hidden_shape = (num_layers, hidden_size)
     if not cfg.resume:
         return ReplayBuffer(
             capacity=cfg.policy.online_buffer_capacity,
@@ -814,9 +821,14 @@ def initialize_replay_buffer(
             # ========== 【GRU 改造新增】透传序列参数 ==========
             use_sequence=use_sequence,
             seq_len=seq_len,
+            # 新增参数
+            store_hidden_states=store_hidden,
+            hidden_shape=hidden_shape,
         )
     logging.info("Resume training load the online dataset")
     dataset_path = os.path.join(cfg.output_dir, "dataset")
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"续训失败，缓存数据集不存在：{dataset_path}")
     # NOTE: In RL is possible to not have a dataset.
     repo_id = None
     if cfg.dataset is not None:
@@ -834,6 +846,9 @@ def initialize_replay_buffer(
         # ========== 【GRU 改造新增】恢复训练时同步加载序列模式 ==========
         use_sequence=use_sequence,
         seq_len=seq_len,
+        # 修复：续训场景同步透传隐藏态配置
+        store_hidden_states=store_hidden,
+        hidden_shape=hidden_shape,
     )
 
 
@@ -855,7 +870,13 @@ def initialize_offline_replay_buffer(
     # ========== 【GRU 改造新增】复用算法配置的序列参数 ==========
     use_sequence = getattr(cfg.algorithm, "use_sequence", False)
     seq_len = getattr(cfg.algorithm, "seq_len", 32)
-
+    # 新增：推导隐藏态配置，和在线Buffer逻辑完全对齐
+    store_hidden = use_sequence and getattr(cfg.policy, "use_gru", False)
+    hidden_shape = None
+    if store_hidden:
+        num_layers = getattr(cfg.policy, "num_gru_layers", 2)
+        hidden_size = getattr(cfg.policy, "gru_hidden_size", 64)
+        hidden_shape = (num_layers, hidden_size)
     if not cfg.resume:
         logging.info("make_dataset offline buffer")
         offline_dataset = make_dataset(cfg)
@@ -877,6 +898,9 @@ def initialize_offline_replay_buffer(
         # ========== 【GRU 改造新增】透传序列参数 ==========
         use_sequence=use_sequence,
         seq_len=seq_len,
+        # 修复：同步透传隐藏态配置
+        store_hidden_states=store_hidden,
+        hidden_shape=hidden_shape,
     )
     return offline_replay_buffer
 
@@ -987,18 +1011,25 @@ def process_transitions(
             ):
                 logging.warning("[LEARNER] NaN detected in transition, skipping")
                 continue
-            # 提取隐藏态（没有则为None，兼容旧版数据）
-            hidden_state = transition.get("complementary_info", {}).pop("initial_hidden", None)
+            # 只读获取，不修改原 transition 对象
+            comp_info = transition.get("complementary_info", {})
+            hidden_state = comp_info.get("initial_hidden", None)
+
             replay_buffer.add(
                 **transition,
                 hidden_state=hidden_state,
             )
 
+
             # Add to offline buffer if it's an intervention
             if dataset_repo_id is not None and transition.get("complementary_info", {}).get(
                 TeleopEvents.IS_INTERVENTION.value
             ):
-                offline_replay_buffer.add(**transition)
+                offline_replay_buffer.add(
+                    **transition,
+                    hidden_state=hidden_state,
+                )
+
 
 
 def process_interaction_messages(
