@@ -81,6 +81,9 @@ class SACAlgorithm(RLAlgorithm):
             for _ in range(self.config.num_critics)
         ]
         self.critic_ensemble = CriticEnsemble(encoder=encoder, ensemble=heads)
+        # ========== 新增：目标网络使用独立编码器深拷贝 ==========
+        # 对齐参考代码 summarizer_targ 设计，彻底解决共享编码器导致的目标网络失效
+        target_encoder = copy.deepcopy(encoder)
         target_heads = [
             CriticHead(
                 input_dim=encoder.output_dim + action_dim,
@@ -88,7 +91,8 @@ class SACAlgorithm(RLAlgorithm):
             )
             for _ in range(self.config.num_critics)
         ]
-        self.critic_target = CriticEnsemble(encoder=encoder, ensemble=target_heads)
+        self.critic_target = CriticEnsemble(encoder=target_encoder, ensemble=target_heads)
+        # ========================================================
         self.critic_target.load_state_dict(self.critic_ensemble.state_dict())
 
         # TODO(Khalil): Investigate and fix torch.compile
@@ -103,15 +107,17 @@ class SACAlgorithm(RLAlgorithm):
 
     def _init_discrete_critic_target(self, encoder: GaussianActorObservationEncoder) -> DiscreteCritic:
         """Build target discrete critic (main network is owned by the policy)."""
+        # 目标网络使用独立编码器深拷贝
+        target_encoder = copy.deepcopy(encoder)
         discrete_critic_target = DiscreteCritic(
-            encoder=encoder,
+            encoder=target_encoder,
             input_dim=encoder.output_dim,
             output_dim=self.policy_config.num_discrete_actions,
             **asdict(self.config.discrete_critic_network_kwargs),
         )
-        # TODO(Khalil): Compile the discrete critic
         discrete_critic_target.load_state_dict(self.policy.discrete_critic.state_dict())
         return discrete_critic_target
+
 
     def _init_temperature(self, continuous_action_dim: int) -> None:
         """Set up temperature parameter (log_alpha) and target entropy."""
@@ -600,21 +606,22 @@ class SACAlgorithm(RLAlgorithm):
             self.policy.discrete_critic.load_state_dict(discrete_sd)
 
     def state_dict(self) -> dict[str, torch.Tensor]:
-        """Algorithm-owned trainable tensors.
-
-        Encoder weights are stripped because they are owned by the policy
-        (``policy.encoder_critic``) and already saved via ``policy.save_pretrained``.
-        """
+        """Algorithm-owned trainable tensors."""
         bundle: dict[str, torch.Tensor] = {}
+        # 在线Critic：编码器属于policy，继续剥离权重
         for k, v in _strip_encoder_keys(self.critic_ensemble.state_dict()).items():
             bundle[f"critic_ensemble.{k}"] = v
-        for k, v in _strip_encoder_keys(self.critic_target.state_dict()).items():
+        # ========== 修改：目标Critic保留完整权重（含独立目标编码器） ==========
+        for k, v in self.critic_target.state_dict().items():
             bundle[f"critic_target.{k}"] = v
+        # 离散目标Critic同理：保留完整编码器权重
         if self.discrete_critic_target is not None:
-            for k, v in _strip_encoder_keys(self.discrete_critic_target.state_dict()).items():
+            for k, v in self.discrete_critic_target.state_dict().items():
                 bundle[f"discrete_critic_target.{k}"] = v
+        # ===================================================================
         bundle["log_alpha"] = self.log_alpha.detach()
         return bundle
+
 
     def load_state_dict(
         self,
