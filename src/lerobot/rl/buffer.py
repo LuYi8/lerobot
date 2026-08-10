@@ -590,8 +590,41 @@ class ReplayBuffer:
                     # Non-tensor values can be used directly
                     else:
                         frame_dict[f"complementary_info.{key}"] = val
-
+            #修改
+            # for key, value in frame_dict.items():
+            #     if key.startswith("observation.images."):   # 识别图像键
+            #         if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
+            #             # 检查值范围，若最大值 > 1 则视为 [0,255]，否则视为 [0,1]
+            #             if value.max() > 1.0:
+            #                 # 直接 clamp 并转为 uint8
+            #                 frame_dict[key] = value.clamp(0, 255).byte()
+            #             else:
+            #                 # 归一化到 [0,255]
+            #                 frame_dict[key] = (value * 255).clamp(0, 255).byte()
+            #         # 如果已经是 uint8 则无需处理
+            #结束
             # Add to the dataset's buffer
+            #修改 ========= 新增：图像归一化 =========
+            # 在 add_frame 之前，归一化所有图像
+            for key, value in frame_dict.items():
+                if key.startswith("observation.images."):   # 识别图像键
+                    if isinstance(value, torch.Tensor):
+                        # 若值已经是 uint8，则转为 float 并缩放到 [0,1]
+                        if value.dtype == torch.uint8:
+                            value = value.float() / 255.0
+                        # 若为 float，检查范围并做归一化
+                        elif value.dtype.is_floating_point:
+                            # 如果最大值大于 1.0，说明是以 0~255 存储的，需除以 255
+                            if value.max() > 1.0:
+                                value = value / 255.0
+                            # 最后 clamp 到 [0,1] 防止微小溢出
+                            value = value.clamp(0.0, 1.0)
+                        # 其他类型（如 int）可以忽略或转换
+                        frame_dict[key] = value
+                    # 如果 value 不是 Tensor，可根据需要处理，一般应该是 Tensor
+            #结束 ==================================
+
+
             lerobot_dataset.add_frame(frame_dict)
 
             # If we reached an episode boundary, call save_episode, reset counters

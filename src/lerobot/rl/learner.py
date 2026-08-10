@@ -247,6 +247,8 @@ def start_learner_threads(
         )
         logging.info("[LEARNER] Training process stopped")
     except Exception:
+        import traceback
+        traceback.print_exc()
         logging.exception("[LEARNER] Unhandled exception in training loop")
         shutdown_event.set()
     finally:

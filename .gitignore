@@ -176,3 +176,11 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+#
+.mp4
+.safetensors
+output/
+checkpoint/
+checkpoint_actor/
+offlint_dataset/

@@ -204,6 +204,8 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
         )
         logging.info("[ACTOR] Policy loop finished")
     except Exception:
+        import traceback
+        traceback.print_exc()
         logging.exception("[ACTOR] Unhandled exception in act_with_policy")
         shutdown_event.set()
     finally:
@@ -260,6 +262,7 @@ def act_with_policy(
     logging.info("make_env online")
 
     online_env, teleop_device = make_robot_env(cfg=cfg.env)
+    print(f"Environment action space shape: {online_env.action_space.shape}")
     env_processor, action_processor = make_processors(online_env, teleop_device, cfg.env, cfg.policy.device)
 
     set_seed(cfg.seed)
@@ -316,7 +319,10 @@ def act_with_policy(
             action = policy.select_action(batch=normalized_observation)
             # Unnormalize only the continuous part.
             if cfg.policy.num_discrete_actions is not None:
+                #修改
                 continuous_action = postprocessor.process_action(action[..., :-1])
+                #continuous_action = postprocessor.process_action(action)
+                #结束
                 discrete_action = action[..., -1:].to(
                     device=continuous_action.device, dtype=continuous_action.dtype
                 )
