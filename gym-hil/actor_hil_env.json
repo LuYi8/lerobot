@@ -450,7 +450,12 @@
             "use_tanh_squash": true,
             "std_min": 1e-5,
             "std_max": 5,
-            "init_final": 0.05
+            "init_final": 0.05,
+            "use_recurrent": true,
+            "recurrent_type": "gru",
+            "recurrent_hidden_dim": 64,
+            "recurrent_num_layers": 1,
+            "bptt_len": 10
         },
         "discrete_critic_network_kwargs": {
             "hidden_dims": [256, 256],

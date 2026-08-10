@@ -312,7 +312,15 @@ def act_with_policy(
         observation = {
             k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
         }
-
+        # ========== 新增：原始状态NaN兜底 ==========
+        state_key = "observation.state"
+        if state_key in observation:
+            if torch.isnan(observation[state_key]).any():
+                logging.warning("环境输出observation.state含NaN，已用0替换")
+                observation[state_key] = torch.nan_to_num(
+                    observation[state_key], nan=0.0, posinf=10.0, neginf=-10.0
+                )
+        # ==========================================
         # Time policy inference and check if it meets FPS requirement
         with policy_timer:
             normalized_observation = preprocessor.process_observation(observation)
@@ -429,6 +437,7 @@ def act_with_policy(
             episode_total_steps = 0
 
             transition = reset_and_build_transition(online_env, env_processor, action_processor)
+            policy.reset()  # 清空循环隐藏态，每个episode从零开始记忆
 
         if cfg.env.fps is not None:
             dt_time = time.perf_counter() - start_time
@@ -727,7 +736,6 @@ def update_policy_parameters(algorithm: RLAlgorithm, parameters_queue: Queue, de
 
 def push_transitions_to_transport_queue(transitions: list, transitions_queue):
     """Send transitions to learner in smaller chunks to avoid network issues.
-
     Args:
         transitions: List of transitions to send
         message_queue: Queue to send messages to learner
@@ -736,13 +744,38 @@ def push_transitions_to_transport_queue(transitions: list, transitions_queue):
     transition_to_send_to_learner = []
     for transition in transitions:
         tr = move_transition_to_device(transition=transition, device="cpu")
+        has_nan = False
+
+        # 校验 state 所有观测字段
         for key, value in tr["state"].items():
             if torch.isnan(value).any():
-                logging.warning(f"Found NaN values in transition {key}")
+                logging.warning(f"丢弃含NaN的transition: state[{key}]")
+                has_nan = True
+                break
+        if has_nan:
+            continue
+
+        # 校验 next_state 所有观测字段
+        for key, value in tr["next_state"].items():
+            if torch.isnan(value).any():
+                logging.warning(f"丢弃含NaN的transition: next_state[{key}]")
+                has_nan = True
+                break
+        if has_nan:
+            continue
+
+        # 校验动作张量
+        if torch.isnan(tr["action"]).any():
+            logging.warning("丢弃含NaN的transition: action")
+            continue
 
         transition_to_send_to_learner.append(tr)
 
+    if len(transition_to_send_to_learner) == 0:
+        logging.warning("本批transition全部含NaN，未发送任何数据")
+        return
     transitions_queue.put(transitions_to_bytes(transition_to_send_to_learner))
+
 
 
 def get_frequency_stats(timer: TimerManager) -> dict[str, float]:

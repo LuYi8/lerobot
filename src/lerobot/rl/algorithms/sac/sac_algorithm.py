@@ -42,6 +42,7 @@ from lerobot.utils.transition import move_state_dict_to_device
 from ..base import RLAlgorithm
 from ..configs import TrainingStats
 from .configuration_sac import SACAlgorithmConfig
+import copy
 
 
 class SACAlgorithm(RLAlgorithm):
@@ -177,103 +178,146 @@ class SACAlgorithm(RLAlgorithm):
         return q_values
 
     def update(self, batch_iterator: Iterator[BatchType]) -> TrainingStats:
-        """Run one SAC training step (critic / discrete-critic / actor / temperature).
-
-        Pulls ``utd_ratio`` batches from ``batch_iterator``, computes the relevant
-        losses, backpropagates each, and updates target networks.
-
-        Args:
-            batch_iterator: yields batches each containing
-                - ``action``: Action tensor
-                - ``reward``: Reward tensor
-                - ``state``: Observations tensor dict
-                - ``next_state``: Next observations tensor dict
-                - ``done``: Done mask tensor
-                - ``observation_feature``: Optional pre-computed observation features
-                - ``next_observation_feature``: Optional pre-computed next observation features
-                - ``complementary_info`` (optional): per-step extras like discrete penalties
-
-        Returns:
-            TrainingStats with per-component losses and grad norms.
-        """
         clip = self.config.grad_clip_norm
 
+        # 统计容器
+        critic_losses = []
+        q1_means, q2_means, q_target_means = [], [], []
+        critic_grad_norms = []
+        discrete_critic_losses = []
+        discrete_critic_grad_norms = []
+
+        # ---- 1. 前 utd_ratio-1 次 Critic 更新 ----
         for _ in range(self.config.utd_ratio - 1):
             batch = next(batch_iterator)
             fb = self._prepare_forward_batch(batch, include_complementary_info=True)
 
-            loss_critic = self._compute_loss_critic(fb)
+            # 连续Critic更新
+            loss_critic, q_preds, q_target = self._compute_loss_critic(fb, return_details=True)
+            critic_losses.append(loss_critic.item())
+            q1_means.append(q_preds[0].mean().item())
+            q2_means.append(q_preds[1].mean().item())
+            q_target_means.append(q_target.mean().item())
+
             self.optimizers["critic"].zero_grad()
             loss_critic.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic_ensemble.parameters(), max_norm=clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.critic_ensemble.parameters(), max_norm=clip)
+            critic_grad_norms.append(grad_norm.item())
             self.optimizers["critic"].step()
 
+            # 离散Critic更新（若存在）
             if self.policy_config.num_discrete_actions is not None:
                 loss_dc = self._compute_loss_discrete_critic(fb)
+                discrete_critic_losses.append(loss_dc.item())
+
                 self.optimizers["discrete_critic"].zero_grad()
                 loss_dc.backward()
-                torch.nn.utils.clip_grad_norm_(self.policy.discrete_critic.parameters(), max_norm=clip)
+                dc_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.policy.discrete_critic.parameters(), max_norm=clip
+                )
+                discrete_critic_grad_norms.append(dc_grad_norm.item())
                 self.optimizers["discrete_critic"].step()
 
-            self._update_target_networks()
-
+        # ---- 2. 第 utd 次 Critic 更新（与Actor复用Batch） ----
         batch = next(batch_iterator)
-        fb = self._prepare_forward_batch(batch, include_complementary_info=False)
+        fb = self._prepare_forward_batch(batch, include_complementary_info=True)
 
-        loss_critic = self._compute_loss_critic(fb)
+        # 连续Critic
+        loss_critic, q_preds, q_target = self._compute_loss_critic(fb, return_details=True)
+        critic_losses.append(loss_critic.item())
+        q1_means.append(q_preds[0].mean().item())
+        q2_means.append(q_preds[1].mean().item())
+        q_target_means.append(q_target.mean().item())
+
         self.optimizers["critic"].zero_grad()
         loss_critic.backward()
-        critic_grad = torch.nn.utils.clip_grad_norm_(self.critic_ensemble.parameters(), max_norm=clip).item()
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.critic_ensemble.parameters(), max_norm=clip)
+        critic_grad_norms.append(grad_norm.item())
         self.optimizers["critic"].step()
 
-        stats = TrainingStats(
-            losses={"loss_critic": loss_critic.item()},
-            grad_norms={"critic": critic_grad},
-        )
-
+        # 离散Critic
         if self.policy_config.num_discrete_actions is not None:
             loss_dc = self._compute_loss_discrete_critic(fb)
+            discrete_critic_losses.append(loss_dc.item())
+
             self.optimizers["discrete_critic"].zero_grad()
             loss_dc.backward()
-            dc_grad = torch.nn.utils.clip_grad_norm_(
+            dc_grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.policy.discrete_critic.parameters(), max_norm=clip
-            ).item()
+            )
+            discrete_critic_grad_norms.append(dc_grad_norm.item())
             self.optimizers["discrete_critic"].step()
-            stats.losses["loss_discrete_critic"] = loss_dc.item()
-            stats.grad_norms["discrete_critic"] = dc_grad
 
+        # ---- 3. 汇总基础指标 ----
+        stats_dict = {
+            "loss/critic": sum(critic_losses) / len(critic_losses),
+            "q_value/q1_mean": sum(q1_means) / len(q1_means),
+            "q_value/q2_mean": sum(q2_means) / len(q2_means),
+            "q_value/q_target_mean": sum(q_target_means) / len(q_target_means),
+            "grad_norm/critic": sum(critic_grad_norms) / len(critic_grad_norms),
+        }
+        if self.policy_config.num_discrete_actions is not None:
+            stats_dict["loss/discrete_critic"] = sum(discrete_critic_losses) / len(discrete_critic_losses)
+            stats_dict["grad_norm/discrete_critic"] = sum(discrete_critic_grad_norms) / len(discrete_critic_grad_norms)
+
+        # ---- 4. Actor 与温度更新（按频率执行） ----
         if self._optimization_step % self.config.policy_update_freq == 0:
-            for _ in range(self.config.policy_update_freq):
-                loss_actor = self._compute_loss_actor(fb)
-                self.optimizers["actor"].zero_grad()
-                loss_actor.backward()
-                actor_grad = torch.nn.utils.clip_grad_norm_(
-                    self.policy.actor.parameters(), max_norm=clip
-                ).item()
-                self.optimizers["actor"].step()
+            loss_actor, actions, log_pi, mean = self._compute_loss_actor(fb, return_details=True)
 
-                loss_temp = self._compute_loss_temperature(fb)
-                self.optimizers["temperature"].zero_grad()
-                loss_temp.backward()
-                temp_grad = torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=clip).item()
-                self.optimizers["temperature"].step()
+            stats_dict["loss/actor"] = loss_actor.item()
+            stats_dict["action/mean"] = actions.mean().item()
+            stats_dict["action/std"] = actions.std().item()
+            stats_dict["action/min"] = actions.min().item()
+            stats_dict["action/max"] = actions.max().item()
+            stats_dict["policy/log_pi_mean"] = log_pi.mean().item()
+            stats_dict["policy/mean_avg"] = mean.mean().item()
 
-            stats.losses["loss_actor"] = loss_actor.item()
-            stats.losses["loss_temperature"] = loss_temp.item()
-            stats.grad_norms["actor"] = actor_grad
-            stats.grad_norms["temperature"] = temp_grad
-            stats.extra["temperature"] = self.temperature
+            self.optimizers["actor"].zero_grad()
+            loss_actor.backward()
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.actor.parameters(), max_norm=clip)
+            stats_dict["grad_norm/actor"] = actor_grad_norm.item()
+            self.optimizers["actor"].step()
 
+            # 温度更新
+            loss_temp = self._compute_loss_temperature(fb)
+            stats_dict["loss/temperature"] = loss_temp.item()
+            stats_dict["alpha/value"] = self.temperature
+            stats_dict["alpha/target_entropy"] = self.target_entropy
+
+            self.optimizers["temperature"].zero_grad()
+            loss_temp.backward()
+            temp_grad_norm = torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=clip)
+            stats_dict["grad_norm/temperature"] = temp_grad_norm.item()
+            self.optimizers["temperature"].step()
+
+        # ---- 5. 目标网络软更新（每轮1次，对齐标准SAC） ----
         self._update_target_networks()
-        self._optimization_step += 1
-        return stats
 
-    def _compute_loss_critic(self, batch: dict[str, Any]) -> Tensor:
-        # Extract common components from batch
+        # ---- 6. 步数递增 ----
+        self._optimization_step += 1
+
+        # ---- 7. 构造 TrainingStats 返回 ----
+        losses = {k: v for k, v in stats_dict.items() if k.startswith("loss/")}
+        grad_norms = {k: v for k, v in stats_dict.items() if k.startswith("grad_norm/")}
+        extra = {k: v for k, v in stats_dict.items() if k not in losses and k not in grad_norms}
+
+        return TrainingStats(losses=losses, grad_norms=grad_norms, extra=extra)
+
+
+
+    def _compute_loss_critic(self, batch: dict, return_details: bool = False):
+        # 提取 batch 字段（原代码误用 batch 但参数是 fb，已修正）
         observations = batch["state"]
+        # 新增：定位NaN来源
+        for k, v in observations.items():
+            has_nan = torch.isnan(v).any().item()
+            has_inf = torch.isinf(v).any().item()
+            if has_nan or has_inf:
+                print(f"[根因确认] 送入编码器的 {k} 已含NaN:{has_nan} 含Inf:{has_inf}")
+                print(f"  数值范围: {v.min().item():.4f} ~ {v.max().item():.4f}")
+                print(f"[LOSS_CRTIC] 观测 {k} 含NaN:{has_nan} 含Inf:{has_inf} 形状:{v.shape}")
         actions = batch[ACTION]
         observation_features = batch.get("observation_feature")
-        # Extract critic-specific components
         rewards = batch["reward"]
         next_observations = batch["next_state"]
         done = batch["done"]
@@ -283,35 +327,28 @@ class SACAlgorithm(RLAlgorithm):
             next_action_preds, next_log_probs, _ = self.policy.actor(
                 next_observations, next_observation_features
             )
-
-            # 2- compute q targets
             q_targets = self._critic_forward(
                 observations=next_observations,
                 actions=next_action_preds,
                 use_target=True,
                 observation_features=next_observation_features,
             )
-
-            # subsample critics to prevent overfitting if use high UTD (update to date)
-            # TODO: Get indices before forward pass to avoid unnecessary computation
+            # 可选的 subsample critics
             if self.config.num_subsample_critics is not None:
-                indices = torch.randperm(self.config.num_critics)
-                indices = indices[: self.config.num_subsample_critics]
+                indices = torch.randperm(self.config.num_critics)[:self.config.num_subsample_critics]
                 q_targets = q_targets[indices]
 
-            # critics subsample size
-            min_q, _ = q_targets.min(dim=0)  # Get values from min operation
+            min_q, _ = q_targets.min(dim=0)
             if self.config.use_backup_entropy:
                 min_q = min_q - (self.temperature * next_log_probs)
 
             td_target = rewards + (1 - done) * self.config.discount * min_q
 
-        # 3- compute predicted qs
+        # 拆分离散动作（如果需要）
         if self.policy_config.num_discrete_actions is not None:
-            # NOTE: We only want to keep the continuous action part
-            # In the buffer we have the full action space (continuous + discrete)
-            # We need to split them before concatenating them in the critic forward
-            actions: Tensor = actions[:, :DISCRETE_DIMENSION_INDEX]
+            actions = actions[..., :DISCRETE_DIMENSION_INDEX]
+
+
         q_preds = self._critic_forward(
             observations=observations,
             actions=actions,
@@ -319,17 +356,28 @@ class SACAlgorithm(RLAlgorithm):
             observation_features=observation_features,
         )
 
-        # 4- Calculate loss
-        # Compute state-action value loss (TD loss) for all of the Q functions in the ensemble.
-        td_target_duplicate = einops.repeat(td_target, "b -> e b", e=q_preds.shape[0])
-        # You compute the mean loss of the batch for each critic and then to compute the final loss you sum them up
-        critics_loss = (
-            F.mse_loss(
-                input=q_preds,
-                target=td_target_duplicate,
-                reduction="none",
-            ).mean(dim=1)
-        ).sum()
+        td_target_expanded = td_target.unsqueeze(0).expand_as(q_preds)
+        loss_elementwise = F.mse_loss(input=q_preds, target=td_target_expanded, reduction="none")
+
+        # 处理序列掩码
+        mask = None
+        complementary_info = batch.get("complementary_info")
+        if complementary_info is not None:
+            mask = complementary_info.get("sequence_mask")
+
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(0).expand_as(loss_elementwise)
+            loss_sum = (loss_elementwise * mask_expanded).sum()
+            num_valid = mask.sum() * self.config.num_critics
+            critics_loss = loss_sum / num_valid.clamp(min=1)
+        else:
+            # 单步模式：与原生计算结果完全等价
+            critics_loss = loss_elementwise.mean(dim=1)
+        if torch.isnan(td_target).any():
+            print("td_target contains NaN")
+            import pdb; pdb.set_trace()
+        if return_details:
+            return critics_loss, q_preds, td_target   # 明确返回 q_preds 和 td_target
         return critics_loss
 
     def _compute_loss_discrete_critic(self, batch: dict[str, Any]) -> Tensor:
@@ -345,7 +393,7 @@ class SACAlgorithm(RLAlgorithm):
         # NOTE: We only want to keep the discrete action part
         # In the buffer we have the full action space (continuous + discrete)
         # We need to split them before concatenating them in the critic forward
-        actions_discrete: Tensor = actions[:, DISCRETE_DIMENSION_INDEX:].clone()
+        actions_discrete: Tensor = actions[..., DISCRETE_DIMENSION_INDEX:].clone()
         actions_discrete = torch.round(actions_discrete)
         actions_discrete = actions_discrete.long()
 
@@ -369,7 +417,7 @@ class SACAlgorithm(RLAlgorithm):
 
             # Use gather to select Q-values for best actions
             target_next_discrete_q = torch.gather(
-                target_next_discrete_qs, dim=1, index=best_next_discrete_action
+                target_next_discrete_qs, dim=-1, index=best_next_discrete_action
             ).squeeze(-1)
 
             # Compute target Q-value with Bellman equation
@@ -384,17 +432,28 @@ class SACAlgorithm(RLAlgorithm):
         )
 
         # Use gather to select Q-values for taken actions
-        predicted_discrete_q = torch.gather(predicted_discrete_qs, dim=1, index=actions_discrete).squeeze(-1)
+        predicted_discrete_q = torch.gather(predicted_discrete_qs, dim=-1, index=actions_discrete).squeeze(-1)
 
-        # Compute MSE loss between predicted and target Q-values
-        discrete_critic_loss = F.mse_loss(input=predicted_discrete_q, target=target_discrete_q)
+        loss_elementwise = F.mse_loss(input=predicted_discrete_q, target=target_discrete_q, reduction="none")
+
+        mask = None
+        if complementary_info is not None:
+            mask = complementary_info.get("sequence_mask")
+
+        if mask is not None:
+            discrete_critic_loss = (loss_elementwise * mask).sum() / mask.sum().clamp(min=1)
+        else:
+            discrete_critic_loss = loss_elementwise.mean()
+
         return discrete_critic_loss
 
-    def _compute_loss_actor(self, batch: dict[str, Any]) -> Tensor:
+
+    def _compute_loss_actor(self, batch: dict, return_details: bool = False):
         observations = batch["state"]
         observation_features = batch.get("observation_feature")
 
-        actions_pi, log_probs, _ = self.policy.actor(observations, observation_features)
+        # 解包三个返回值
+        actions_pi, log_probs, mean = self.policy.actor(observations, observation_features)
 
         q_preds = self._critic_forward(
             observations=observations,
@@ -403,21 +462,44 @@ class SACAlgorithm(RLAlgorithm):
             observation_features=observation_features,
         )
         min_q_preds = q_preds.min(dim=0)[0]
+        loss_elementwise = (self.temperature * log_probs) - min_q_preds
 
-        actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
+        mask = None
+        complementary_info = batch.get("complementary_info")
+        if complementary_info is not None:
+            mask = complementary_info.get("sequence_mask")
+
+        if mask is not None:
+            actor_loss = (loss_elementwise * mask).sum() / mask.sum().clamp(min=1)
+        else:
+            actor_loss = loss_elementwise.mean()
+
+        if return_details:
+            # 如果需要 log_std，可以通过重新获取分布来得到（但 forward 不返回）
+            # 方案见下文
+            return actor_loss, actions_pi, log_probs, mean
         return actor_loss
 
     def _compute_loss_temperature(self, batch: dict[str, Any]) -> Tensor:
-        """Compute the temperature loss"""
         observations = batch["state"]
         observation_features = batch.get("observation_feature")
 
-        # calculate temperature loss
         with torch.no_grad():
             _, log_probs, _ = self.policy.actor(observations, observation_features)
 
-        temperature_loss = (-self.log_alpha.exp() * (log_probs + self.target_entropy)).mean()
+        loss_elementwise = -self.log_alpha.exp() * (log_probs + self.target_entropy)
+
+        mask = None
+        if batch.get("complementary_info") is not None:
+            mask = batch["complementary_info"].get("sequence_mask")
+
+        if mask is not None:
+            temperature_loss = (loss_elementwise * mask).sum() / mask.sum().clamp(min=1)
+        else:
+            temperature_loss = loss_elementwise.mean()
+
         return temperature_loss
+
 
     def _update_target_networks(self) -> None:
         """Update target networks with exponential moving average"""
@@ -583,6 +665,18 @@ class SACAlgorithm(RLAlgorithm):
 
         return observation_features, next_observation_features
 
+    def configure_data_iterator(self, data_mixer, batch_size: int):
+        """配置数据迭代器：循环模式采样序列，普通模式沿用原生采样
+        上层RLTrainer直接调用该方法获取迭代器，无需感知底层采样方式
+        """
+        if self.policy_config.policy_kwargs.use_recurrent:
+            seq_len = self.policy_config.policy_kwargs.bptt_len
+            def _seq_iterator():
+                while True:
+                    yield data_mixer.sample_sequence(batch_size, seq_len)
+            return _seq_iterator()
+        else:
+            return data_mixer.get_iterator(batch_size=batch_size)
 
 def _strip_encoder_keys(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Drop ``encoder.*`` keys from a critic-module state dict."""

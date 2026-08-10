@@ -73,7 +73,12 @@ class PolicyConfig:
     std_min: float = 1e-5
     std_max: float = 10.0
     init_final: float = 0.05
-
+    # ========== 新增：循环时序配置 ==========
+    use_recurrent: bool = False          # 总开关，默认关闭等价原生SAC
+    recurrent_type: str = "gru"          # 循环单元类型，当前仅支持GRU
+    recurrent_hidden_dim: int = 256      # GRU隐藏层维度
+    recurrent_num_layers: int = 1        # GRU网络层数
+    bptt_len: int = 10                   # 截断反向传播时序长度
 
 @PreTrainedConfig.register_subclass("gaussian_actor")
 @dataclass

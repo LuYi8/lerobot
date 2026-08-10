@@ -18,7 +18,7 @@ import abc
 
 from lerobot.types import BatchType
 
-from ..buffer import ReplayBuffer, concatenate_batch_transitions
+from ..buffer import BatchTransition, ReplayBuffer, concatenate_batch_transitions
 
 
 class DataMixer(abc.ABC):
@@ -95,3 +95,25 @@ class OnlineOfflineMixer(DataMixer):
 
         while True:
             yield concatenate_batch_transitions(next(online_iter), next(offline_iter))
+
+    def sample_sequence(self, batch_size: int, seq_len: int) -> BatchTransition:
+        """时序采样：按online_ratio比例混合在线与离线缓冲的序列样本"""
+        online_bs = int(batch_size * self.online_ratio)
+        offline_bs = batch_size - online_bs
+
+        batches = []
+        if online_bs > 0 and self.online_buffer is not None:
+            batches.append(self.online_buffer.sample_sequence(online_bs, seq_len))
+        if offline_bs > 0 and self.offline_buffer is not None:
+            batches.append(self.offline_buffer.sample_sequence(offline_bs, seq_len))
+
+        if not batches:
+            raise RuntimeError("No valid buffer for sequence sampling")
+        if len(batches) == 1:
+            return batches[0]
+
+        # 复用现有拼接工具函数，在batch维度合并
+        result = batches[0]
+        for b in batches[1:]:
+            result = concatenate_batch_transitions(result, b)
+        return result

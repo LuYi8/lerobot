@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import functools
+import logging
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import suppress
@@ -199,18 +200,28 @@ class ReplayBuffer:
         truncated: bool,
         complementary_info: dict[str, torch.Tensor] | None = None,
     ):
-        """Saves a transition, ensuring tensors are stored on the designated storage device."""
         with self._lock:
-            # Initialize storage if this is the first transition
             if not self.initialized:
                 self._initialize_storage(state=state, action=action, complementary_info=complementary_info)
 
-            # Store the transition in pre-allocated tensors
+            # ========== 移到最前面：输入校验，通过后再写入 ==========
+            for key in self.states:
+                if torch.isnan(state[key]).any() or torch.isnan(next_state[key]).any():
+                    logging.warning(f"ReplayBuffer跳过含NaN的transition: {key}")
+                    return
+                # 补充 Inf 检查，避免无穷值后续计算出 NaN
+                if torch.isinf(state[key]).any() or torch.isinf(next_state[key]).any():
+                    logging.warning(f"ReplayBuffer跳过含Inf的transition: {key}")
+                    return
+            if torch.isnan(action).any() or torch.isinf(action).any():
+                logging.warning("ReplayBuffer跳过含NaN/Inf的transition: action")
+                return
+            # =====================================================
+
+            # 校验通过后再执行所有写入操作
             for key in self.states:
                 self.states[key][self.position].copy_(state[key].squeeze(dim=0))
-
                 if not self.optimize_memory:
-                    # Only store next_states if not optimizing memory
                     self.next_states[key][self.position].copy_(next_state[key].squeeze(dim=0))
 
             self.actions[self.position].copy_(action.squeeze(dim=0))
@@ -218,7 +229,6 @@ class ReplayBuffer:
             self.dones[self.position] = done
             self.truncateds[self.position] = truncated
 
-            # Handle complementary_info if provided and storage is initialized
             if complementary_info is not None and self.has_complementary_info:
                 for key in self.complementary_info_keys:
                     if key in complementary_info:
@@ -230,6 +240,7 @@ class ReplayBuffer:
 
             self.position = (self.position + 1) % self.capacity
             self.size = min(self.size + 1, self.capacity)
+
 
     def sample(self, batch_size: int) -> BatchTransition:
         """Sample a random batch of transitions and collate them into batched tensors."""
@@ -288,6 +299,124 @@ class ReplayBuffer:
                 batch_state[key] = augmented_images[i * 2 * batch_size : (i * 2 + 1) * batch_size]
                 # Next states start after the states at index (i*2+1)*batch_size and also take up batch_size slots
                 batch_next_state[key] = augmented_images[(i * 2 + 1) * batch_size : (i + 1) * 2 * batch_size]
+
+        return BatchTransition(
+            state=batch_state,
+            action=batch_actions,
+            reward=batch_rewards,
+            next_state=batch_next_state,
+            done=batch_dones,
+            truncated=batch_truncateds,
+            complementary_info=batch_complementary_info,
+        )
+
+    def sample_sequence(self, batch_size: int, seq_len: int) -> BatchTransition:
+        """采样连续时序片段，用于截断BPTT训练
+        自动处理环形缓冲区边界与episode边界，生成有效步掩码
+        在线/离线缓冲通用，兼容optimize_memory模式与DRQ图像增强
+
+        Args:
+            batch_size: 批次大小
+            seq_len: 时序长度（对应bptt_len）
+        Returns:
+            带时间维度的BatchTransition，complementary_info中包含sequence_mask有效步掩码
+        """
+        if not self.initialized:
+            raise RuntimeError("Cannot sample from an empty buffer.")
+        if seq_len < 1:
+            raise ValueError("seq_len must be at least 1")
+        if self.size < seq_len:
+            raise ValueError(f"Buffer size {self.size} smaller than seq_len {seq_len}")
+
+        with self._lock:
+            batch_size = min(batch_size, self.size)
+
+            # ========== 环形缓冲区连续段识别（核心边界校验） ==========
+            # 缓冲区未满：只有一段连续数据 [0, size)
+            # 缓冲区已满：环形存储分为两段 [0, position) 和 [position, capacity)
+            segments = []
+            if self.size < self.capacity:
+                segments.append((0, self.size))
+            else:
+                if self.position > 0:
+                    segments.append((0, self.position))  # 前段：0 ~ position-1
+                if self.position < self.capacity:
+                    segments.append((self.position, self.capacity))  # 后段：position ~ capacity-1
+
+            # 过滤长度不足seq_len的无效段
+            # seq_len 个 transition 需要 seq_len+1 个连续 state，否则最后一步 next_state 越界
+            valid_segments = [(start, end) for start, end in segments if (end - start) >= seq_len + 1]
+
+            if not valid_segments:
+                raise RuntimeError(f"No valid segment longer than seq_len={seq_len} in buffer")
+
+            # 按段长度加权采样，保证样本分布均匀
+            seg_lengths = [end - start - seq_len + 1 for start, end in valid_segments]
+            total_valid = sum(seg_lengths)
+            seg_probs = torch.tensor([l / total_valid for l in seg_lengths], device=self.storage_device)
+            seg_indices = torch.multinomial(seg_probs, batch_size, replacement=True)
+
+            # 为每个样本生成连续起始索引
+            starts = torch.zeros(batch_size, dtype=torch.long, device=self.storage_device)
+            for i in range(batch_size):
+                seg_start, seg_end = valid_segments[seg_indices[i].item()]
+                # 保证最后一步的 next_state 仍在有效段内
+                max_start = seg_end - seq_len - 1
+
+                starts[i] = torch.randint(seg_start, max_start + 1, (1,), device=self.storage_device).item()
+
+            # 生成连续序列索引矩阵 (B, T)
+            indices = starts.unsqueeze(1) + torch.arange(seq_len, device=self.storage_device).unsqueeze(0)
+
+            # ========== 采集状态与下一状态 ==========
+            batch_state = {}
+            batch_next_state = {}
+            for key in self.states:
+                batch_state[key] = self.states[key][indices].to(self.device)
+                if not self.optimize_memory:
+                    batch_next_state[key] = self.next_states[key][indices].to(self.device)
+                else:
+                    # 内存优化模式：next_state[i] = state[i+1]，处理环形取模
+                    next_indices = (indices + 1) % self.capacity
+                    batch_next_state[key] = self.states[key][next_indices].to(self.device)
+
+            # 采集基础字段
+            batch_actions = self.actions[indices].to(self.device)
+            batch_rewards = self.rewards[indices].to(self.device)
+            batch_dones = self.dones[indices].to(self.device).float()
+            batch_truncateds = self.truncateds[indices].to(self.device).float()
+
+            # ========== 生成episode边界有效步mask ==========
+            # 规则：终止步本身有效，终止步之后的所有位置无效，避免跨episode梯度污染
+            terminal = batch_dones.bool() | batch_truncateds.bool()
+            terminal_cumsum = terminal.cumsum(dim=1)
+            mask = (terminal_cumsum <= 1).float()  # 第一次终止及之前为有效步
+
+            # ========== 补充信息与mask ==========
+            batch_complementary_info = {}
+            if self.has_complementary_info:
+                for key in self.complementary_info_keys:
+                    batch_complementary_info[key] = self.complementary_info[key][indices].to(self.device)
+            batch_complementary_info["sequence_mask"] = mask
+
+        # ========== DRQ图像增强兼容 ==========
+        image_keys = [k for k in self.states if k.startswith(OBS_IMAGE)] if self.use_drq else []
+        if image_keys:
+            B, T = batch_size, seq_len
+            all_images = []
+            for key in image_keys:
+                # 合并batch和time维度，统一做增强后拆分
+                all_images.append(batch_state[key].reshape(B * T, *batch_state[key].shape[2:]))
+                all_images.append(batch_next_state[key].reshape(B * T, *batch_next_state[key].shape[2:]))
+
+            all_images_tensor = torch.cat(all_images, dim=0)
+            augmented_images = self.image_augmentation_function(all_images_tensor)
+
+            # 拆分回各图像的state/next_state，并恢复时序维度
+            for i, key in enumerate(image_keys):
+                base = i * 2 * B * T
+                batch_state[key] = augmented_images[base:base + B*T].reshape(B, T, *augmented_images.shape[1:])
+                batch_next_state[key] = augmented_images[base + B*T:base + 2*B*T].reshape(B, T, *augmented_images.shape[1:])
 
         return BatchTransition(
             state=batch_state,
@@ -480,16 +609,25 @@ class ReplayBuffer:
             )
 
         # Fill the buffer with all transitions
+        skip_count = 0
         for data in list_transition:
+            # 前置NaN校验
+            has_nan = False
+            for key in data["state"]:
+                if torch.isnan(data["state"][key]).any() or torch.isnan(data["next_state"][key]).any():
+                    has_nan = True
+                    break
+            if has_nan or torch.isnan(data[ACTION]).any():
+                skip_count += 1
+                continue
+
             for k, v in data.items():
                 if isinstance(v, dict):
                     for key, tensor in v.items():
                         v[key] = tensor.to(storage_device)
                 elif isinstance(v, torch.Tensor):
                     data[k] = v.to(storage_device)
-
             action = data[ACTION]
-
             replay_buffer.add(
                 state=data["state"],
                 action=action,
@@ -499,6 +637,9 @@ class ReplayBuffer:
                 truncated=False,  # NOTE: Truncation are not supported yet in lerobot dataset
                 complementary_info=data.get("complementary_info", None),
             )
+        if skip_count > 0:
+            logging.warning(f"离线数据集加载跳过 {skip_count} 帧含NaN的transition")
+
 
         return replay_buffer
 

@@ -63,8 +63,11 @@ class GaussianActorPolicy(
         return optim_params
 
     def reset(self):
-        """Reset the policy"""
-        pass
+        """Reset the policy. Clears RNN hidden states in recurrent mode."""
+        if self.config.policy_kwargs.use_recurrent:
+            self.encoder_actor.reset()
+            self.encoder_critic.reset()
+
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -122,12 +125,20 @@ class GaussianActorPolicy(
     def _init_actor(self, continuous_action_dim):
         """Initialize policy actor network."""
         # NOTE: The actor select only the continuous action part
+        # ========== 新增：过滤循环配置，仅保留策略头需要的参数 ==========
+        from dataclasses import asdict
+        policy_kwargs_full = asdict(self.config.policy_kwargs)
+        # 循环层在编码器中实现，Policy 类无需这些参数
+        recurrent_keys = {"use_recurrent", "recurrent_type", "recurrent_hidden_dim", "recurrent_num_layers", "bptt_len"}
+        policy_kwargs_filtered = {k: v for k, v in policy_kwargs_full.items() if k not in recurrent_keys}
+        # ================================================================
+
         self.actor = Policy(
             encoder=self.encoder_actor,
             network=MLP(input_dim=self.encoder_actor.output_dim, **asdict(self.config.actor_network_kwargs)),
             action_dim=continuous_action_dim,
             encoder_is_shared=self.shared_encoder,
-            **asdict(self.config.policy_kwargs),
+            **policy_kwargs_filtered,  # 使用过滤后的参数
         )
 
     def _init_discrete_critic(self) -> None:
@@ -144,6 +155,36 @@ class GaussianActorPolicy(
             **asdict(self.config.discrete_critic_network_kwargs),
         )
 
+    def state_dict(self, *args, **kwargs):
+        sd = super().state_dict(*args, **kwargs)
+        if self.shared_encoder:
+            # 第一步：移除重复的编码器键名，仅保留 actor.encoder 下的一份
+            keys_to_remove = []
+            for k in sd:
+                if k.startswith("encoder_actor.") or k.startswith("encoder_critic."):
+                    keys_to_remove.append(k)
+            for k in keys_to_remove:
+                del sd[k]
+        
+        # 第二步：强制所有张量连续化，打破 GRU flat_weight 视图共享
+        # 彻底解决 Safetensors "none is covering the entire storage" 报错
+        for k, v in sd.items():
+            if isinstance(v, torch.Tensor):
+                sd[k] = v.detach().clone().contiguous()
+        return sd
+
+    def load_state_dict(self, state_dict, strict=True, **kwargs):
+        if self.shared_encoder:
+            # 加载时将 actor.encoder 的权重同步回两个编码器引用
+            new_sd = dict(state_dict)
+            for k, v in state_dict.items():
+                if k.startswith("actor.encoder."):
+                    suffix = k[len("actor.encoder."):]
+                    new_sd[f"encoder_actor.{suffix}"] = v
+                    new_sd[f"encoder_critic.{suffix}"] = v
+            state_dict = new_sd
+        return super().load_state_dict(state_dict, strict=strict, **kwargs)
+
 
 class GaussianActorObservationEncoder(nn.Module):
     """Encode image and/or state vector observations."""
@@ -155,6 +196,25 @@ class GaussianActorObservationEncoder(nn.Module):
         self._init_state_layers()
         self._compute_output_dim()
 
+        # ========== 新增：共享时序GRU编码层 ==========
+        self.use_recurrent = config.policy_kwargs.use_recurrent
+        if self.use_recurrent:
+            if config.policy_kwargs.recurrent_type != "gru":
+                raise ValueError(f"Unsupported recurrent type: {config.policy_kwargs.recurrent_type}")
+            self.rnn = nn.GRU(
+                input_size=self._out_dim,
+                hidden_size=config.policy_kwargs.recurrent_hidden_dim,
+                num_layers=config.policy_kwargs.recurrent_num_layers,
+                batch_first=True,
+            )
+            # 在 self.rnn = nn.GRU(...) 之后追加
+            self.rnn_norm = nn.LayerNorm(config.policy_kwargs.recurrent_hidden_dim)
+
+            self.hidden = None  # 推理跨步隐藏态缓存
+            # 更新编码器输出维度为GRU隐藏维度
+            self._out_dim = config.policy_kwargs.recurrent_hidden_dim
+
+        
     def _init_image_layers(self) -> None:
         self.image_keys = [k for k in self.config.input_features if is_image_feature(k)]
         self.has_images = bool(self.image_keys)
@@ -235,64 +295,136 @@ class GaussianActorObservationEncoder(nn.Module):
         if self.has_state:
             parts.append(self.state_encoder(obs[OBS_STATE]))
         if parts:
-            return torch.cat(parts, dim=-1)
+            x = torch.cat(parts, dim=-1)
+        else:
+            raise ValueError(
+                "No parts to concatenate, you should have at least one image or environment state or state"
+            )
 
-        raise ValueError(
-            "No parts to concatenate, you should have at least one image or environment state or state"
-        )
+        # ========== 新增：时序编码分支 ==========
+        if self.use_recurrent:
+            if x.ndim == 2:
+                # 单步推理：补时间维度，复用缓存隐藏态，输出对齐原维度
+                x = x.unsqueeze(1)  # (B, 1, D)
+                # 隐藏态为空时显式初始化为零向量
+                if self.hidden is None:
+                    batch_size = x.shape[0]
+                    self.hidden = torch.zeros(
+                        self.rnn.num_layers, batch_size, self.rnn.hidden_size,
+                        device=x.device, dtype=x.dtype
+                    )
+                x, self.hidden = self.rnn(x, self.hidden)
+                x = self.rnn_norm(x)  # 新增：单步也做归一化
+                x = x.squeeze(1)  # (B, hidden_dim)，与原生输出维度完全一致
+
+            else:
+                # 序列训练：每次独立初始化隐藏态，不跨batch复用
+                x, _ = self.rnn(x)  # (B, T, hidden_dim)
+                x = self.rnn_norm(x)  # 新增：时序维度归一化
+        return x
+
+    def reset(self) -> None:
+        """清空循环隐藏态，episode重置时调用"""
+        if self.use_recurrent:
+            self.hidden = None
+
+
+    # def get_cached_image_features(self, obs: dict[str, Tensor]) -> dict[str, Tensor]:
+    #     """Extract and optionally cache image features from observations.
+
+    #     This function processes image observations through the vision encoder once and returns
+    #     the resulting features.
+    #     When the image encoder is shared between actor and critics AND frozen, these features can be safely cached and
+    #     reused across policy components (actor, critic, discrete_critic), avoiding redundant forward passes.
+
+    #     Performance impact:
+    #     - The vision encoder forward pass is typically the main computational bottleneck during training and inference
+    #     - Caching these features can provide 2-4x speedup in training and inference
+
+    #     Usage patterns:
+    #     - Called in select_action()
+    #     - Called in learner.py's get_observation_features() to pre-compute features for all policy components
+    #     - Called internally by forward()
+
+    #     Args:
+    #         obs: Dictionary of observation tensors containing image keys
+
+    #     Returns:
+    #         Dictionary mapping image keys to their corresponding encoded features
+    #     """
+    #     batched = torch.cat([obs[k] for k in self.image_keys], dim=0)
+    #     out = self.image_encoder(batched)
+    #     chunks = torch.chunk(out, len(self.image_keys), dim=0)
+    #     return dict(zip(self.image_keys, chunks, strict=False))
 
     def get_cached_image_features(self, obs: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Extract and optionally cache image features from observations.
+        # 自动识别是否带时序维度：(B,C,H,W)单步 / (B,T,C,H,W)序列
+        first_img = obs[self.image_keys[0]]
+        has_seq_dim = first_img.ndim == 5
 
-        This function processes image observations through the vision encoder once and returns
-        the resulting features.
-        When the image encoder is shared between actor and critics AND frozen, these features can be safely cached and
-        reused across policy components (actor, critic, discrete_critic), avoiding redundant forward passes.
+        if has_seq_dim:
+            B, T = first_img.shape[0], first_img.shape[1]
+            # 合并Batch与Time维度，适配CNN的4D输入要求
+            batched = torch.cat([obs[k].reshape(-1, *obs[k].shape[2:]) for k in self.image_keys], dim=0)
+        else:
+            batched = torch.cat([obs[k] for k in self.image_keys], dim=0)
 
-        Performance impact:
-        - The vision encoder forward pass is typically the main computational bottleneck during training and inference
-        - Caching these features can provide 2-4x speedup in training and inference
-
-        Usage patterns:
-        - Called in select_action()
-        - Called in learner.py's get_observation_features() to pre-compute features for all policy components
-        - Called internally by forward()
-
-        Args:
-            obs: Dictionary of observation tensors containing image keys
-
-        Returns:
-            Dictionary mapping image keys to their corresponding encoded features
-        """
-        batched = torch.cat([obs[k] for k in self.image_keys], dim=0)
         out = self.image_encoder(batched)
         chunks = torch.chunk(out, len(self.image_keys), dim=0)
-        return dict(zip(self.image_keys, chunks, strict=False))
+
+        # 恢复原始维度结构
+        result = {}
+        for idx, key in enumerate(self.image_keys):
+            feat = chunks[idx]
+            if has_seq_dim:
+                feat = feat.reshape(B, T, *feat.shape[1:])
+            result[key] = feat
+        return result
+
+    # def _encode_images(self, cache: dict[str, Tensor], detach: bool) -> Tensor:
+    #     """Encode image features from cached observations.
+
+    #     This function takes pre-encoded image features from the cache and applies spatial embeddings and post-encoders.
+    #     It also supports detaching the encoded features if specified.
+
+    #     Args:
+    #         cache (dict[str, Tensor]): The cached image features.
+    #         detach (bool): Usually when the encoder is shared between actor and critics,
+    #         we want to detach the encoded features on the policy side to avoid backprop through the encoder.
+    #         More detail here `https://cdn.aaai.org/ojs/17276/17276-13-20770-1-2-20210518.pdf`
+
+    #     Returns:
+    #         Tensor: The encoded image features.
+    #     """
+    #     feats = []
+    #     for k, feat in cache.items():
+    #         safe_key = k.replace(".", "_")
+    #         x = self.spatial_embeddings[safe_key](feat)
+    #         x = self.post_encoders[safe_key](x)
+    #         if detach:
+    #             x = x.detach()
+    #         feats.append(x)
+    #     return torch.cat(feats, dim=-1)
 
     def _encode_images(self, cache: dict[str, Tensor], detach: bool) -> Tensor:
-        """Encode image features from cached observations.
-
-        This function takes pre-encoded image features from the cache and applies spatial embeddings and post-encoders.
-        It also supports detaching the encoded features if specified.
-
-        Args:
-            cache (dict[str, Tensor]): The cached image features.
-            detach (bool): Usually when the encoder is shared between actor and critics,
-            we want to detach the encoded features on the policy side to avoid backprop through the encoder.
-            More detail here `https://cdn.aaai.org/ojs/17276/17276-13-20770-1-2-20210518.pdf`
-
-        Returns:
-            Tensor: The encoded image features.
-        """
         feats = []
         for k, feat in cache.items():
             safe_key = k.replace(".", "_")
+            has_seq_dim = feat.ndim == 5
+            if has_seq_dim:
+                B, T = feat.shape[0], feat.shape[1]
+                feat = feat.reshape(-1, *feat.shape[2:])  # 合并为 (B*T, C, H, W)
+
             x = self.spatial_embeddings[safe_key](feat)
             x = self.post_encoders[safe_key](x)
+
+            if has_seq_dim:
+                x = x.reshape(B, T, -1)  # 恢复时序维度 (B, T, latent_dim)
             if detach:
                 x = x.detach()
             feats.append(x)
         return torch.cat(feats, dim=-1)
+
 
     @property
     def output_dim(self) -> int:
@@ -451,16 +583,23 @@ class Policy(nn.Module):
         # We detach the encoder if it is shared to avoid backprop through it
         # This is important to avoid the encoder to be updated through the policy
         obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
-
+        if torch.isnan(obs_enc).any():
+            print("NaN in obs_enc! Input obs:")
+            for k, v in observations.items():
+                print(k, torch.isnan(v).any())
+            raise ValueError("NaN in encoder output")
         # Get network outputs
         outputs = self.network(obs_enc)
         means = self.mean_layer(outputs)
-
+        if torch.isnan(means).any():
+            print(f"encoder out nan: {torch.isnan(obs_enc).any()}")
+            print(f"mlp out nan: {torch.isnan(outputs).any()}")
+            print(f"mean out nan: {torch.isnan(means).any()}")
         # Compute standard deviations
         if self.fixed_std is None:
             log_std = self.std_layer(outputs)
-            std = torch.exp(log_std)  # Match JAX "exp"
-            std = torch.clamp(std, self.std_min, self.std_max)  # Match JAX default clip
+            log_std = torch.clamp(log_std, self.std_min, self.std_max)
+            std = torch.exp(log_std)
         else:
             std = self.fixed_std.expand_as(means)
 
