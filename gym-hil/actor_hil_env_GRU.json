@@ -8,7 +8,7 @@
     "steps": 99000,
     "log_freq": 1,
     "save_checkpoint": true,
-    "save_freq": 500,
+    "save_freq": 1000,
     "wandb": {
         "enable": true,
         "project": "hil_sac_gru",
@@ -26,7 +26,7 @@
         "actor_lr": 1e-4,
         "critic_lr": 1e-4,
         "temperature_lr": 1e-4,
-        "discount": 0.99,
+        "discount": 0.95,
         "use_backup_entropy": true,
         "critic_target_update_weight": 0.005,
         "num_critics": 2,
@@ -435,8 +435,8 @@
         "image_encoder_hidden_dim": 32,
         "shared_encoder": true,
         "online_steps": 99000,
-        "online_buffer_capacity": 8000,
-        "offline_buffer_capacity": 2000,
+        "online_buffer_capacity": 1000,
+        "offline_buffer_capacity": 8000,
         "online_step_before_learning": 100,
         "state_encoder_hidden_dim": 64,
         "latent_dim": 64,
@@ -451,11 +451,11 @@
             "std_min": -20,
             "std_max": 2,
             "init_final": 0.05,
-            "use_recurrent": true,
+            "use_recurrent": false,
             "recurrent_type": "gru",
             "recurrent_hidden_dim": 64,
             "recurrent_num_layers": 1,
-            "bptt_len": 4
+            "bptt_len": 8
         },
         "discrete_critic_network_kwargs": {
             "hidden_dims": [256, 256],

@@ -366,7 +366,13 @@ class SACAlgorithm(RLAlgorithm):
             if self.config.use_backup_entropy:
                 min_q = min_q - (self.temperature * next_log_probs)
 
-            td_target = rewards + (1 - done) * self.config.discount * min_q
+            # ===== 原代码（错误，仅用done判断终止） =====
+            # td_target = rewards + (1 - done) * self.config.discount * min_q
+
+            # ===== 修改后（正确，done + truncated 均视为终止） =====
+            terminal = (done.float() + batch["truncated"].float()).clamp(max=1.0)
+            td_target = rewards + (1 - terminal) * self.config.discount * min_q
+
 
         # 拆分离散动作（如果需要）
         if self.policy_config.num_discrete_actions is not None:
@@ -388,6 +394,28 @@ class SACAlgorithm(RLAlgorithm):
         complementary_info = batch.get("complementary_info")
         if complementary_info is not None:
             mask = complementary_info.get("sequence_mask")
+            # ========== 新增：mask 有效性校验打印 ==========
+            if mask is not None:
+                total_steps = mask.numel()
+                valid_steps = mask.sum().item()
+                valid_ratio = valid_steps / total_steps
+                avg_seq_valid_len = mask.sum(dim=1).mean().item()
+                
+                # 每 100 个 batch 打印一次，避免刷屏
+                if not hasattr(self, '_mask_log_cnt'):
+                    self._mask_log_cnt = 0
+                self._mask_log_cnt += 1
+                
+                if self._mask_log_cnt % 100 == 0:
+                    print(
+                        f"[Mask校验] step={self._optimization_step} | "
+                        f"总步数={total_steps} | "
+                        f"有效步数={valid_steps:.0f} | "
+                        f"有效占比={valid_ratio:.2%} | "
+                        f"单序列平均有效长度={avg_seq_valid_len:.1f}"
+                    )
+            # =============================================
+
 
         if mask is not None:
             mask_expanded = mask.unsqueeze(0).expand_as(loss_elementwise)
@@ -395,8 +423,8 @@ class SACAlgorithm(RLAlgorithm):
             num_valid = mask.sum() * self.config.num_critics
             critics_loss = loss_sum / num_valid.clamp(min=1)
         else:
-            # 单步模式：与原生计算结果完全等价
-            critics_loss = loss_elementwise.mean(dim=1)
+            # 单步模式：全局平均得到标量损失，兼容两个Critic
+            critics_loss = loss_elementwise.mean()
         if torch.isnan(td_target).any():
             print("td_target contains NaN")
             import pdb; pdb.set_trace()
@@ -448,7 +476,13 @@ class SACAlgorithm(RLAlgorithm):
             rewards_discrete = rewards
             if discrete_penalties is not None:
                 rewards_discrete = rewards + discrete_penalties
-            target_discrete_q = rewards_discrete + (1 - done) * self.config.discount * target_next_discrete_q
+            # ===== 原代码（错误） =====
+            # target_discrete_q = rewards_discrete + (1 - done) * self.config.discount * target_next_discrete_q
+
+            # ===== 修改后（正确） =====
+            terminal = (done.float() + batch["truncated"].float()).clamp(max=1.0)
+            target_discrete_q = rewards_discrete + (1 - terminal) * self.config.discount * target_next_discrete_q
+
 
         # Get predicted Q-values for current observations
         predicted_discrete_qs = self._discrete_critic_forward(
@@ -559,6 +593,7 @@ class SACAlgorithm(RLAlgorithm):
             "state": observations,
             "next_state": next_observations,
             "done": batch["done"],
+            "truncated": batch["truncated"],  # 新增：透传截断终止标志
             "observation_feature": observation_features,
             "next_observation_feature": next_observation_features,
         }
