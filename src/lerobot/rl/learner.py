@@ -789,17 +789,6 @@ def log_training_info(cfg: TrainRLServerPipelineConfig, policy: nn.Module) -> No
 def initialize_replay_buffer(
     cfg: TrainRLServerPipelineConfig, device: str, storage_device: str
 ) -> ReplayBuffer:
-    """
-    Initialize a replay buffer, either empty or from a dataset if resuming.
-
-    Args:
-        cfg (TrainRLServerPipelineConfig): Training configuration
-        device (str): Device to store tensors on
-        storage_device (str): Device for storage optimization
-
-    Returns:
-        ReplayBuffer: Initialized replay buffer
-    """
     if not cfg.resume:
         return ReplayBuffer(
             capacity=cfg.policy.online_buffer_capacity,
@@ -809,24 +798,34 @@ def initialize_replay_buffer(
             optimize_memory=True,
         )
 
-    logging.info("Resume training load the online dataset")
+    logging.info("Resume training: try to load online dataset")
     dataset_path = os.path.join(cfg.output_dir, "dataset")
+    try:
+        dataset = LeRobotDataset(
+            repo_id=None,
+            root=dataset_path,
+        )
+        return ReplayBuffer.from_lerobot_dataset(
+            lerobot_dataset=dataset,
+            capacity=cfg.policy.online_buffer_capacity,
+            device=device,
+            state_keys=cfg.policy.input_features.keys(),
+            optimize_memory=True,
+        )
+    except Exception as e:
+        logging.warning(
+            f"Failed to load online dataset for resume: {e}. "
+            "Starting with empty online buffer. Training will resume after collecting new online data."
+        )
+        # 加载失败直接新建空缓冲区，不中断训练
+        return ReplayBuffer(
+            capacity=cfg.policy.online_buffer_capacity,
+            device=device,
+            state_keys=cfg.policy.input_features.keys(),
+            storage_device=storage_device,
+            optimize_memory=True,
+        )
 
-    # NOTE: In RL is possible to not have a dataset.
-    repo_id = None
-    if cfg.dataset is not None:
-        repo_id = cfg.dataset.repo_id
-    dataset = LeRobotDataset(
-        repo_id=repo_id,
-        root=dataset_path,
-    )
-    return ReplayBuffer.from_lerobot_dataset(
-        lerobot_dataset=dataset,
-        capacity=cfg.policy.online_buffer_capacity,
-        device=device,
-        state_keys=cfg.policy.input_features.keys(),
-        optimize_memory=True,
-    )
 
 
 def initialize_offline_replay_buffer(

@@ -47,9 +47,22 @@ class GaussianActorPolicy(
         self.config = config
 
         # Determine action dimension and initialize all components
-        continuous_action_dim = config.output_features[ACTION].shape[0]
+        #continuous_action_dim = config.output_features[ACTION].shape[0]
+        # ====== 原代码（替换为下方内容） ======
+        # continuous_action_dim = config.output_features[ACTION].shape[0]
+        # self._init_actor(continuous_action_dim)
+        # ====== 修改后 ======
+        total_action_dim = config.output_features[ACTION].shape[0]
+        if config.num_discrete_actions is not None:
+            # 离散动作占最后1维，剩余维度为连续动作
+            continuous_action_dim = total_action_dim - 1
+        else:
+            continuous_action_dim = total_action_dim
+
+
         self._init_encoders()
         self._init_actor(continuous_action_dim)
+        #self._init_actor(continuous_action_dim)
         self._init_discrete_critic()
 
     def get_optim_params(self) -> dict:

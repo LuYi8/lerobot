@@ -62,9 +62,21 @@ class SACAlgorithm(RLAlgorithm):
         self.optimizers: dict[str, Optimizer] = {}
         self._optimization_step: int = 0
 
-        action_dim = self.policy.config.output_features[ACTION].shape[0]
-        self._init_critics(action_dim)
-        self._init_temperature(action_dim)
+        # ====== 原代码（替换为下方内容） ======
+        # action_dim = self.policy.config.output_features[ACTION].shape[0]
+        # self._init_critics(action_dim)
+        # self._init_temperature(action_dim)
+
+        # ====== 修改后 ======
+        total_action_dim = self.policy.config.output_features[ACTION].shape[0]
+        if self.policy_config.num_discrete_actions is not None:
+            continuous_action_dim = total_action_dim - 1
+        else:
+            continuous_action_dim = total_action_dim
+
+        self._init_critics(continuous_action_dim)
+        self._init_temperature(continuous_action_dim)
+
 
         self._device = torch.device(self.policy.config.device)
         self._move_to_device()
@@ -125,11 +137,17 @@ class SACAlgorithm(RLAlgorithm):
         self.log_alpha = nn.Parameter(torch.tensor([math.log(temp_init)]))
 
         self.target_entropy = self.config.target_entropy
+        # ====== 原代码（替换为下方内容） ======
+        # if self.target_entropy is None:
+        #     total_action_dim = continuous_action_dim + (
+        #         1 if self.policy_config.num_discrete_actions is not None else 0
+        #     )
+        #     self.target_entropy = -total_action_dim / 2
+
+        # ====== 修改后 ======
         if self.target_entropy is None:
-            total_action_dim = continuous_action_dim + (
-                1 if self.policy_config.num_discrete_actions is not None else 0
-            )
-            self.target_entropy = -total_action_dim / 2
+            # 仅连续动作参与熵正则，离散动作不纳入温度优化
+            self.target_entropy = -continuous_action_dim / 2
 
     def _move_to_device(self) -> None:
         self.policy.to(self._device)

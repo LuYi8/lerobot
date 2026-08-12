@@ -326,20 +326,75 @@ def act_with_policy(
             normalized_observation = preprocessor.process_observation(observation)
             action = policy.select_action(batch=normalized_observation)
             # Unnormalize only the continuous part.
+            # ========== 修改后（修复代码） ==========
             if cfg.policy.num_discrete_actions is not None:
-                #修改
-                continuous_action = postprocessor.process_action(action[..., :-1])
-                #continuous_action = postprocessor.process_action(action)
-                #结束
+                
+                # 1. 构造与原动作空间维度一致的占位张量，匹配postprocessor统计量维度
+                full_action_placeholder = torch.zeros_like(action)
+                full_action_placeholder[..., :-1] = action[..., :-1]  # 填入前3维连续动作
+                # 2. 完整走一遍反归一化，维度完全匹配，不会报错
+                full_unnormalized = postprocessor.process_action(full_action_placeholder)
+                # 3. 只提取前3维反归一化后的连续动作
+                continuous_action = full_unnormalized[..., :-1]
+                
                 discrete_action = action[..., -1:].to(
                     device=continuous_action.device, dtype=continuous_action.dtype
                 )
                 action = torch.cat([continuous_action, discrete_action], dim=-1)
             else:
                 action = postprocessor.process_action(action)
+            
+            # ========== 标签定义：与训练端严格对齐（绝对不能改） ==========
+            LABEL_CLOSE = 1.0   # 标签1 = 闭合指令
+            LABEL_OPEN  = 0.0   # 标签0 = 张开指令
+
+            # ========== 硬件映射：与实测物理动作严格对齐 ==========
+            HARDWARE_CLOSE = 2.0  # 硬件值2.0 = 物理闭合
+            HARDWARE_OPEN  = 0.0  # 硬件值0.0 = 物理张开
+
+            # ========== 不对称滞回参数：闭合快、张开慢，优先保持夹紧 ==========
+            CLOSE_STABLE_FRAMES = 2   # 闭合指令2帧稳定即执行
+            OPEN_STABLE_FRAMES  = 1   # 张开指令需连续2帧稳定才执行
+
+            # ========== 初始化（episode重置时同步清零） ==========
+            if not hasattr(act_with_policy, 'gripper_stable_count'):
+                act_with_policy.gripper_stable_count = 0
+                act_with_policy.current_gripper_label = LABEL_OPEN  # 初始状态：张开
+
+            # ========== 滞回核心逻辑 ==========
+            target_label = action[..., 3].item()
+
+            # 指令与当前状态一致，清零计数
+            if target_label == act_with_policy.current_gripper_label:
+                act_with_policy.gripper_stable_count = 0
+            else:
+                act_with_policy.gripper_stable_count += 1
+                # 目标是闭合 → 低阈值快速响应；目标是张开 → 高阈值防抖
+                threshold = CLOSE_STABLE_FRAMES if target_label == LABEL_CLOSE else OPEN_STABLE_FRAMES
+                if act_with_policy.gripper_stable_count >= threshold:
+                    act_with_policy.current_gripper_label = target_label
+                    act_with_policy.gripper_stable_count = 0
+
+            # ========== 最终映射到硬件真实指令 ==========
+            if act_with_policy.current_gripper_label == LABEL_CLOSE:
+                action[..., 3] = HARDWARE_CLOSE
+            else:
+                action[..., 3] = HARDWARE_OPEN
+
+            # 调试日志（保留即可）
+            #logging.debug(f"[滞回调试] 策略输出={target_label:.0f}, 当前执行标签={act_with_policy.current_gripper_label:.0f}, 计数={act_with_policy.gripper_stable_count}")
+
+
+
+
         policy_fps = policy_timer.fps_last
 
         log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
+        # 第一次测试：强制发硬件值 0.0，观察夹爪是开还是合
+        #action[..., 3] = 0.0
+
+        # 第二次测试：注释上面一行，解开下面一行再测
+        #action[..., 3] = 2.0
 
         # Use the new step function
         new_transition = step_env_and_process_transition(
@@ -360,20 +415,44 @@ def act_with_policy(
         # Teleop action is the action that was executed in the environment
         # It is either the action from the teleop device or the action from the policy
         executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
+        
 
+        
         reward = new_transition[TransitionKey.REWARD]
         done = new_transition.get(TransitionKey.DONE, False)
         truncated = new_transition.get(TransitionKey.TRUNCATED, False)
 
         sum_reward_episode += float(reward)
         episode_total_steps += 1
+        # 在拿到 reward 之后加
+        penalty_val = new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)
+        #logging.debug(f"[奖励调试] 总奖励={reward:.4f}, 夹爪惩罚={penalty_val:.4f}")
 
         # Check for intervention from transition info
         intervention_info = new_transition[TransitionKey.INFO]
         is_intervention = bool(intervention_info.get(TeleopEvents.IS_INTERVENTION, False))
+        
         if is_intervention:
             episode_intervention = True
             episode_intervention_steps += 1
+            # ========== 新增：干预期间同步更新策略GRU隐藏态 ==========
+            with torch.no_grad():
+                # 用当前真实观测跑一次前向，只更新隐藏态，不使用输出动作
+                normalized_next_obs = preprocessor.process_observation(next_observation)
+                _ = policy.select_action(batch=normalized_next_obs)
+            # ========================================================
+
+
+        # 离散化部分
+        # 离散化：与离线数据集规则完全一致，保证分布对齐
+        GRIPPER_DIM = 3
+        DISCRETE_THRESHOLD = 1.3  # 和buffer.py严格同步
+        gripper_val = executed_action[..., GRIPPER_DIM].item()
+        discrete_gripper = 1.0 if gripper_val > DISCRETE_THRESHOLD else 0.0
+
+        
+        executed_action = executed_action.clone()
+        executed_action[..., GRIPPER_DIM] = discrete_gripper
 
         complementary_info = {
             "discrete_penalty": torch.tensor(
@@ -438,6 +517,9 @@ def act_with_policy(
 
             transition = reset_and_build_transition(online_env, env_processor, action_processor)
             policy.reset()  # 清空循环隐藏态，每个episode从零开始记忆
+            # 重置夹爪滞回计数器，避免跨episode残留
+            act_with_policy.gripper_stable_count = 0
+            act_with_policy.current_gripper_label = LABEL_OPEN
 
         if cfg.env.fps is not None:
             dt_time = time.perf_counter() - start_time

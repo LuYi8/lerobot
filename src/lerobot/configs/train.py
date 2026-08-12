@@ -180,36 +180,39 @@ class TrainPipelineConfig(HubMixin):
         an HF Job (`job.is_remote`): the pod performs it when it runs the resume locally, and
         `submit_to_hf` resolves the source repo for the remote command.
         """
-        config_path = parser.parse_arg("config_path")
-        if not config_path:
-            raise ValueError(
-                f"A config_path is expected when resuming a run. Please specify path to {TRAIN_CONFIG_NAME}"
-            )
+        # 修复：RL 训练使用独立的 handle_resume_logic，不需要基类这段校验
+        # 基类通过 parser.parse_arg 读 config_path 会因 draccus 消费参数而永远失败
+        # config_path = parser.parse_arg("config_path")
+        # if not config_path:
+        #     raise ValueError(
+        #         f"A config_path is expected when resuming a run. Please specify path to {TRAIN_CONFIG_NAME}"
+        #     )
 
-        if Path(config_path).resolve().exists():
-            policy_dir = Path(config_path).parent
-            self.checkpoint_path = policy_dir.parent
-        elif self.job.is_remote:
-            return
-        else:
-            from lerobot.common.train_utils import resolve_resume_checkpoint
+        # if Path(config_path).resolve().exists():
+        #     policy_dir = Path(config_path).parent
+        #     self.checkpoint_path = policy_dir.parent
+        # elif self.job.is_remote:
+        #     return
+        # else:
+        #     from lerobot.common.train_utils import resolve_resume_checkpoint
 
-            # `self.output_dir` was loaded from the checkpoint's config and points at the original
-            # run's (now-absent) local dir. Resume into a fresh local dir instead, unless the user
-            # passed --output_dir explicitly.
-            cli_output_dir = parser.parse_arg("output_dir")
-            if cli_output_dir:
-                self.output_dir = Path(cli_output_dir)
-            else:
-                now = dt.datetime.now()
-                self.output_dir = Path("outputs/train") / f"{now:%Y-%m-%d}/{now:%H-%M-%S}_resume"
-            self.checkpoint_path = resolve_resume_checkpoint(config_path, self.output_dir)
-            policy_dir = self.checkpoint_path / PRETRAINED_MODEL_DIR
+        #     # `self.output_dir` was loaded from the checkpoint's config and points at the original
+        #     # run's (now-absent) local dir. Resume into a fresh local dir instead, unless the user
+        #     # passed --output_dir explicitly.
+        #     cli_output_dir = parser.parse_arg("output_dir")
+        #     if cli_output_dir:
+        #         self.output_dir = Path(cli_output_dir)
+        #     else:
+        #         now = dt.datetime.now()
+        #         self.output_dir = Path("outputs/train") / f"{now:%Y-%m-%d}/{now:%H-%M-%S}_resume"
+        #     self.checkpoint_path = resolve_resume_checkpoint(config_path, self.output_dir)
+        #     policy_dir = self.checkpoint_path / PRETRAINED_MODEL_DIR
 
-        if self.policy is not None:
-            self.policy.pretrained_path = policy_dir
-        if self.reward_model is not None:
-            self.reward_model.pretrained_path = str(policy_dir)
+        # if self.policy is not None:
+        #     self.policy.pretrained_path = policy_dir
+        # if self.reward_model is not None:
+        #     self.reward_model.pretrained_path = str(policy_dir)
+        return
 
     def validate(self) -> None:
         self._resolve_pretrained_from_cli()

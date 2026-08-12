@@ -4,11 +4,11 @@
     "resume": false,
     "seed": 1000,
     "num_workers": 12,
-    "batch_size": 16,
+    "batch_size": 32,
     "steps": 99000,
     "log_freq": 1,
     "save_checkpoint": true,
-    "save_freq": 1000,
+    "save_freq": 500,
     "wandb": {
         "enable": true,
         "project": "hil_sac_gru",
@@ -23,10 +23,10 @@
     },
     "algorithm": {
         "type": "sac",
-        "actor_lr": 1e-5,
-        "critic_lr": 1e-5,
-        "temperature_lr": 1e-5,
-        "discount": 0.97,
+        "actor_lr": 1e-4,
+        "critic_lr": 1e-4,
+        "temperature_lr": 1e-4,
+        "discount": 0.96,
         "use_backup_entropy": true,
         "critic_target_update_weight": 0.005,
         "num_critics": 2,
@@ -41,9 +41,9 @@
             "activate_final": true,
             "final_activation": null
         },
-        "temperature_init": 0.1,
+        "temperature_init": 0.5,
         "target_entropy": null,
-        "utd_ratio": 2,
+        "utd_ratio": 1,
         "policy_update_freq": 1,
         "grad_clip_norm": 1.0,
         "use_torch_compile": false
@@ -428,15 +428,15 @@
                 ]
             }
         },
-        "num_discrete_actions": null,
+        "num_discrete_actions": 2,
         "storage_device": "cpu",
         "vision_encoder_name": "/home/embody/lerobot/resnet10",
-        "freeze_vision_encoder": false,
+        "freeze_vision_encoder": true,
         "image_encoder_hidden_dim": 32,
         "shared_encoder": true,
-        "online_steps": 10000,
-        "online_buffer_capacity": 5000,
-        "offline_buffer_capacity": 5000,
+        "online_steps": 99000,
+        "online_buffer_capacity": 8000,
+        "offline_buffer_capacity": 2000,
         "online_step_before_learning": 100,
         "state_encoder_hidden_dim": 64,
         "latent_dim": 64,
@@ -448,8 +448,8 @@
         },
         "policy_kwargs": {
             "use_tanh_squash": true,
-            "std_min": 1e-5,
-            "std_max": 5,
+            "std_min": -20,
+            "std_max": 2,
             "init_final": 0.05,
             "use_recurrent": true,
             "recurrent_type": "gru",
@@ -484,7 +484,7 @@
             "control_mode": "keyboard",
             "gripper": {
                 "use_gripper": true,
-                "gripper_penalty": -0.2
+                "gripper_penalty": -0.0
             },
             "reset": {
                 "fixed_reset_joint_positions": [

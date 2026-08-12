@@ -628,6 +628,18 @@ class ReplayBuffer:
                 elif isinstance(v, torch.Tensor):
                     data[k] = v.to(storage_device)
             action = data[ACTION]
+            # ========== 夹爪动作离散化（与在线/推理严格对齐） ==========
+            GRIPPER_DIM = 3          # 夹爪维度索引（第4维）
+            DISCRETE_THRESHOLD = 1.3  # 离散化分界阈值
+            if action.shape[-1] > GRIPPER_DIM:
+                gripper_vals = action[..., GRIPPER_DIM]
+                # 大于阈值 → 夹紧物体/闭合 → 标签1（正样本）
+                # 小于等于阈值 → 空爪张开 → 标签0
+                discrete_gripper = (gripper_vals > DISCRETE_THRESHOLD).float()
+                action[..., GRIPPER_DIM] = discrete_gripper
+            # ========================================================
+
+
             replay_buffer.add(
                 state=data["state"],
                 action=action,
