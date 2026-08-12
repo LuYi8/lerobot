@@ -26,7 +26,7 @@
         "actor_lr": 1e-4,
         "critic_lr": 1e-4,
         "temperature_lr": 1e-4,
-        "discount": 0.96,
+        "discount": 0.99,
         "use_backup_entropy": true,
         "critic_target_update_weight": 0.005,
         "num_critics": 2,
