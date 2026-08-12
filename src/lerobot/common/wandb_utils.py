@@ -111,6 +111,10 @@ class WandBLogger:
             job_type="train_eval",
             resume="must" if cfg.resume else None,
             mode=self.cfg.mode if self.cfg.mode in ["online", "offline", "disabled"] else "online",
+            settings=wandb.Settings(
+            finish_timeout=10,     # run.finish() 结束上传等待，超时直接丢弃，不阻塞退出
+            init_timeout=20,       # wandb.init 初始化等待，默认90s，调小到20s
+        )
         )
         run_id = wandb.run.id
         # NOTE: We will override the cfg.wandb.run_id with the wandb run id.

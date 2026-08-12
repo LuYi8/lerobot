@@ -34,6 +34,7 @@ from . import parser
 from .default import DatasetConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig
 from .policies import PreTrainedConfig
 from .rewards import RewardModelConfig
+import sys
 
 TRAIN_CONFIG_NAME = "train_config.json"
 
@@ -180,7 +181,19 @@ class TrainPipelineConfig(HubMixin):
         an HF Job (`job.is_remote`): the pod performs it when it runs the resume locally, and
         `submit_to_hf` resolves the source repo for the remote command.
         """
-        config_path = parser.parse_arg("config_path")
+        #config_path = parser.parse_arg("config_path")
+        # 手动从原始命令行提取 --config_path，解决 draccus 消费后拿不到的问题
+        config_path = None
+        for i, arg in enumerate(sys.argv):
+            if arg == "--config_path" and i + 1 < len(sys.argv):
+                config_path = sys.argv[i + 1]
+                break
+        
+        # 兜底：如果手动提取失败，再尝试原 parser 方式
+        if config_path is None:
+            config_path = parser.parse_arg("config_path")
+
+            
         if not config_path:
             raise ValueError(
                 f"A config_path is expected when resuming a run. Please specify path to {TRAIN_CONFIG_NAME}"

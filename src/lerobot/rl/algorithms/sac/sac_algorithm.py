@@ -201,8 +201,9 @@ class SACAlgorithm(RLAlgorithm):
         for _ in range(self.config.utd_ratio - 1):
             batch = next(batch_iterator)
             fb = self._prepare_forward_batch(batch, include_complementary_info=True)
+            #===
+            loss_critic, _ = self._compute_loss_critic(fb)
 
-            loss_critic = self._compute_loss_critic(fb)
             self.optimizers["critic"].zero_grad()
             loss_critic.backward()
             torch.nn.utils.clip_grad_norm_(self.critic_ensemble.parameters(), max_norm=clip)
@@ -220,7 +221,7 @@ class SACAlgorithm(RLAlgorithm):
         batch = next(batch_iterator)
         fb = self._prepare_forward_batch(batch, include_complementary_info=False)
 
-        loss_critic = self._compute_loss_critic(fb)
+        loss_critic, q_stats = self._compute_loss_critic(fb)  # 解包出 q_stats
         self.optimizers["critic"].zero_grad()
         loss_critic.backward()
         critic_grad = torch.nn.utils.clip_grad_norm_(self.critic_ensemble.parameters(), max_norm=clip).item()
@@ -230,6 +231,7 @@ class SACAlgorithm(RLAlgorithm):
             losses={"loss_critic": loss_critic.item()},
             grad_norms={"critic": critic_grad},
         )
+        stats.extra.update(q_stats)  # 新增：Q值统计并入日志
 
         if self.policy_config.num_discrete_actions is not None:
             loss_dc = self._compute_loss_discrete_critic(fb)
@@ -330,7 +332,19 @@ class SACAlgorithm(RLAlgorithm):
                 reduction="none",
             ).mean(dim=1)
         ).sum()
-        return critics_loss
+        # 新增：Q值统计（最小改动，仅记录均值）
+        q_stats = {
+            "Q1_mean": q_preds[0].mean().item(),
+            "Q1_std": q_preds[0].std().item(),
+            "Q2_mean": q_preds[1].mean().item(),
+            "Q2_std": q_preds[1].std().item(),
+            "targetQ_mean": td_target.mean().item(),
+            "targetQ_min": td_target.min().item(),
+            "targetQ_max": td_target.max().item(),
+        }
+
+        return critics_loss, q_stats
+
 
     def _compute_loss_discrete_critic(self, batch: dict[str, Any]) -> Tensor:
         observations = batch["state"]
