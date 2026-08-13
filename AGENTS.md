@@ -56,6 +56,18 @@ python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
 - 训练效果参考：抓方块任务约 6000 优化步成功率 60%（历史提交记录）。
 - 干预率是训练质量关键指标：前期频繁干预引导，后期逐步减少。
 
+## GRU 循环增强实验（R-SAC，use_recurrent）
+
+> 完整蓝图与正确性论证见 `gym-hil/上下文归档_SAC增加GRU方案.md`。默认关闭，不开启时行为与上游逐位一致。
+
+- **开关（默认关闭）**：`--policy.policy_kwargs.use_recurrent true` + `recurrent_hidden_size 256` + `recurrent_num_layers 1`；配套 `--algorithm.sequence_length 8`（序列长度，1 = 原逐帧采样）。
+- **计算量恒等**：`batch_size_eff = batch_size // sequence_length`（`SACAlgorithm.configure_data_iterator`），每批帧数 `B×T ≤ 64` 恒定；utd 不变 → 每优化步总帧数与现状相同。
+- **actor/learner 两侧必须同参**：`policy.policy_kwargs` 与 `algorithm.sequence_length` 都要一致（json 不动，CLI 两侧同样追加）。
+- **数据流**：开启后 batch 形状 `(B, T, ...)`；GRU 插在 encoder 与高斯头之间（逐时间步循环，critic 保持前馈）；actor 调用点还原序列视图并传 `done`（掩码时序"处理完第 t 帧后"清零，`_compute_loss_critic` 中 next 侧 done 左移 1 位）。
+- **hidden 生命周期**：训练零初始化不保存；推理 `select_action` 用/更新 `actor._hidden`，episode 边界 `policy.reset()` 清零（actor.py / eval_simple.py 已加）。
+- **实验命令**：见 `命令.txt` 末尾"GRU 循环增强实验"小节；从头训练前删 `gym-hil/output` 与 `gym-hil/output_actor`。
+- 改动点均带 `#修改` 标记（configuration_gaussian_actor.py / configuration_sac.py / modeling_gaussian_actor.py / buffer.py / data_mixer.py / sac_algorithm.py / actor.py / eval_simple.py）。
+
 ## 数据与归一化约定
 
 - **图像**：环境输出为 float [0,255]，本地改动将其归一化到 [0,1]（`buffer.py` 中 `to_lerobot_dataset` 处）；数据集以 uint8 存储，读取时转 float/255。改动此逻辑时注意两端一致性。

@@ -25,7 +25,7 @@ class DataMixer(abc.ABC):
     """Abstract interface for all data mixing strategies."""
 
     @abc.abstractmethod
-    def sample(self, batch_size: int) -> BatchType:
+    def sample(self, batch_size: int, sequence_length: int = 1) -> BatchType:
         """Draw one batch of ``batch_size`` transitions."""
         raise NotImplementedError
 
@@ -34,10 +34,11 @@ class DataMixer(abc.ABC):
         batch_size: int,
         async_prefetch: bool = True,
         queue_size: int = 2,
+        sequence_length: int = 1,
     ):
         """Infinite iterator that yields batches."""
         while True:
-            yield self.sample(batch_size)
+            yield self.sample(batch_size, sequence_length)
 
 
 class OnlineOfflineMixer(DataMixer):
@@ -55,15 +56,19 @@ class OnlineOfflineMixer(DataMixer):
         self.offline_buffer = offline_buffer
         self.online_ratio = online_ratio
 
-    def sample(self, batch_size: int) -> BatchType:
+    #修改 ============ GRU：sequence_length 透传 ============
+    # 序列采样时两个 buffer 各采样 n_online/n_offline 条序列（每条 T 帧），
+    # concatenate 沿 dim0 拼接 (B, T, ...) 天然有效，总帧数 = batch_size × T 不变。
+    #结束 ============================================
+    def sample(self, batch_size: int, sequence_length: int = 1) -> BatchType:
         if self.offline_buffer is None:
-            return self.online_buffer.sample(batch_size)
+            return self.online_buffer.sample(batch_size, sequence_length)
 
         n_online = max(1, int(batch_size * self.online_ratio))
         n_offline = batch_size - n_online
 
-        online_batch = self.online_buffer.sample(n_online)
-        offline_batch = self.offline_buffer.sample(n_offline)
+        online_batch = self.online_buffer.sample(n_online, sequence_length)
+        offline_batch = self.offline_buffer.sample(n_offline, sequence_length)
         return concatenate_batch_transitions(online_batch, offline_batch)
 
     def get_iterator(
@@ -71,6 +76,7 @@ class OnlineOfflineMixer(DataMixer):
         batch_size: int,
         async_prefetch: bool = True,
         queue_size: int = 2,
+        sequence_length: int = 1,
     ):
         """Yield batches by composing buffer async iterators."""
 
@@ -80,6 +86,7 @@ class OnlineOfflineMixer(DataMixer):
             batch_size=n_online,
             async_prefetch=async_prefetch,
             queue_size=queue_size,
+            sequence_length=sequence_length,
         )
 
         if self.offline_buffer is None:
@@ -91,6 +98,7 @@ class OnlineOfflineMixer(DataMixer):
             batch_size=n_offline,
             async_prefetch=async_prefetch,
             queue_size=queue_size,
+            sequence_length=sequence_length,
         )
 
         while True:

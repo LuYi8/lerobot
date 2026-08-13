@@ -65,7 +65,11 @@ class GaussianActorPolicy(
 
     def reset(self):
         """Reset the policy"""
-        pass
+        #修改 ============ GRU：清空 actor 内部 hidden ============
+        # 原为 pass。use_recurrent=true 时推理在 select_action 内持续更新
+        # actor._hidden，episode 边界必须清零，否则下一 episode 沿用旧历史。
+        self.actor.reset()
+        #结束 ============================================
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -82,7 +86,17 @@ class GaussianActorPolicy(
         if self.shared_encoder and self.actor.encoder.has_images:
             observations_features = self.actor.encoder.get_cached_image_features(batch)
 
-        actions, _, _ = self.actor(batch, observations_features)
+        if self.config.policy_kwargs.use_recurrent:
+            #修改 ============ GRU 推理：单帧包成 (B, 1, ...) 序列 ============
+            # 图像特征必须在原 4D batch 上计算（5D 图像会喂崩 ResNet10）；
+            # forward 内部把观测展平回 (B, ...) 与 4D 特征自然对齐；
+            # update_internal_hidden=true 用/更新 self._hidden（首帧零初始化），
+            # episode 边界由 policy.reset() 清零。
+            batch_unsq = {k: v.unsqueeze(1) for k, v in batch.items()}
+            actions, _, _ = self.actor(batch_unsq, observations_features, update_internal_hidden=True)
+            #结束 ============================================
+        else:
+            actions, _, _ = self.actor(batch, observations_features)
 
         if self.config.num_discrete_actions is not None:
             if self.discrete_critic is not None:
@@ -123,9 +137,19 @@ class GaussianActorPolicy(
     def _init_actor(self, continuous_action_dim):
         """Initialize policy actor network."""
         # NOTE: The actor select only the continuous action part
+        #修改 ============ GRU：MLP 输入维 = recurrent_hidden_size ============
+        # use_recurrent=true 时 encoder 输出先过 GRU（输出维 = recurrent_hidden_size）
+        # 再进 MLP，因此 MLP 输入维改用 recurrent_hidden_size（而非 encoder.output_dim，
+        # 二者默认不同：latent_dim 64 → output_dim 192，recurrent_hidden_size 256）。
+        #结束 ============================================
+        network_input_dim = (
+            self.config.policy_kwargs.recurrent_hidden_size
+            if self.config.policy_kwargs.use_recurrent
+            else self.encoder_actor.output_dim
+        )
         self.actor = Policy(
             encoder=self.encoder_actor,
-            network=MLP(input_dim=self.encoder_actor.output_dim, **asdict(self.config.actor_network_kwargs)),
+            network=MLP(input_dim=network_input_dim, **asdict(self.config.actor_network_kwargs)),
             action_dim=continuous_action_dim,
             encoder_is_shared=self.shared_encoder,
             **asdict(self.config.policy_kwargs),
@@ -416,6 +440,14 @@ class Policy(nn.Module):
         init_final: float | None = None,
         use_tanh_squash: bool = False,
         encoder_is_shared: bool = False,
+        #修改 ============ GRU 循环参数 ============
+        # use_recurrent=true 时 encoder 输出 (B*T, D) 逐时间步过 GRU，
+        # hidden 携带跨帧历史；recurrent_hidden_size 需与 network 输入维一致
+        # （默认 256 == latent_dim 256，经 _init_actor 的 asdict 自动传入）。
+        use_recurrent: bool = False,
+        recurrent_hidden_size: int = 256,
+        recurrent_num_layers: int = 1,
+        #结束 ============================================
     ):
         super().__init__()
         self.encoder: GaussianActorObservationEncoder = encoder
@@ -426,6 +458,14 @@ class Policy(nn.Module):
         self.fixed_std = fixed_std
         self.use_tanh_squash = use_tanh_squash
         self.encoder_is_shared = encoder_is_shared
+        #修改 ============ GRU 循环 ============
+        self.use_recurrent = use_recurrent
+        if self.use_recurrent:
+            self.gru = nn.GRU(
+                encoder.output_dim, recurrent_hidden_size, recurrent_num_layers, batch_first=True
+            )
+        self._hidden = None
+        #结束 ============================================
 
         # Find the last Linear layer's output dimension
         for layer in reversed(network.net):
@@ -453,10 +493,51 @@ class Policy(nn.Module):
         self,
         observations: torch.Tensor,
         observation_features: torch.Tensor | None = None,
+        hidden: torch.Tensor | None = None,
+        done: torch.Tensor | None = None,
+        update_internal_hidden: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # We detach the encoder if it is shared to avoid backprop through it
         # This is important to avoid the encoder to be updated through the policy
-        obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
+        #修改 ============ GRU 循环（use_recurrent=true 时） ============
+        # 训练（loss 函数内）传 (B, T, ...) 观测 + (B, T) done；推理（select_action）
+        # 传 (B, 1, ...) 观测、done=None。先把观测展平 (B*T, ...) 再进 encoder——
+        # 与冻结缓存特征 (B*T, C', H', W') 展平态天然对齐（图像/状态编码维度一致）。
+        if self.use_recurrent:
+            first_key = next(iter(observations))
+            B, T = observations[first_key].shape[:2]
+            obs_flat = {k: v.reshape(B * T, *v.shape[2:]) for k, v in observations.items()}
+            obs_enc = self.encoder(obs_flat, cache=observation_features, detach=self.encoder_is_shared)
+            obs_enc = obs_enc.view(B, T, -1)
+            # hidden 语义：None+update_internal_hidden=False（训练）→ 零初始化、不保存；
+            # None+update_internal_hidden=True（推理）→ 用 self._hidden、结束后保存。
+            if hidden is None:
+                hidden = self._hidden if update_internal_hidden else None
+            if hidden is None:
+                hidden = torch.zeros(
+                    self.gru.num_layers,
+                    B,
+                    self.gru.hidden_size,
+                    device=obs_enc.device,
+                    dtype=obs_enc.dtype,
+                )
+            outputs = []
+            h = hidden
+            for t in range(T):
+                out_t, h = self.gru(obs_enc[:, t : t + 1, :], h)
+                outputs.append(out_t)
+                if done is not None:
+                    # 掩码时序固定为"处理完第 t 帧后"执行：done[t]=True 时
+                    # 第 t+1 帧（新 episode 首帧）零历史；掩码在进入帧前执行
+                    # 则整条链错位 1 帧。
+                    h = h * (1 - done[:, t].view(1, B, 1))
+            obs_enc = torch.cat(outputs, dim=1).reshape(B * T, -1)
+            if update_internal_hidden:
+                self._hidden = h.detach()
+        else:
+            # 零回归路径：与改动前逐位一致
+            obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
+        #结束 ============================================
 
         # Get network outputs
         outputs = self.network(obs_enc)
@@ -493,6 +574,15 @@ class Policy(nn.Module):
         log_probs = dist.log_prob(actions)
 
         return actions, log_probs, means
+
+    def reset(self):
+        """Reset internal recurrent hidden state (GRU)."""
+        #修改 ============ GRU：清空推理 hidden ============
+        # 推理时 select_action 每次调用都会更新 self._hidden；
+        # episode 边界（actor.py / eval_simple.py 调 policy.reset()）必须清零，
+        # 否则下一 episode 沿用上一 episode 末帧的历史。
+        self._hidden = None
+        #结束 ============================================
 
     def get_features(self, observations: torch.Tensor) -> torch.Tensor:
         """Get encoded features from observations"""

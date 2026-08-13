@@ -87,6 +87,14 @@ class SACAlgorithmConfig(RLAlgorithmConfig):
     # torch.compile is currently disabled by default
     use_torch_compile: bool = False
 
+    #修改 ============ 序列采样（GRU 循环） ============
+    # sequence_length>1 时 mixer/buffer 按 (B, T, ...) 采样连续帧序列，
+    # batch_size_eff = batch_size // sequence_length，每批总帧数 B×T 不变，
+    # utd 不变 → 每优化步总帧数 = batch_size×utd，计算量与现状完全相同。
+    # 1 = 原采样行为（逐帧独立）。
+    sequence_length: int = 1
+    #结束 ============================================
+
     # Policy config
     policy_config: PreTrainedConfig | None = None
 

@@ -25,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 from torch.optim import Optimizer
+from typing import TYPE_CHECKING, Any
 
 from lerobot.policies.gaussian_actor.modeling_gaussian_actor import (
     DISCRETE_DIMENSION_INDEX,
@@ -42,6 +43,9 @@ from lerobot.utils.transition import move_state_dict_to_device
 from ..base import RLAlgorithm
 from ..configs import TrainingStats
 from .configuration_sac import SACAlgorithmConfig
+
+if TYPE_CHECKING:
+    from ..data_sources.data_mixer import DataMixer
 
 
 class SACAlgorithm(RLAlgorithm):
@@ -180,6 +184,32 @@ class SACAlgorithm(RLAlgorithm):
         q_values = discrete_critic(observations, observation_features)
         return q_values
 
+    def configure_data_iterator(
+        self,
+        data_mixer: DataMixer,
+        batch_size: int,
+        *,
+        async_prefetch: bool = True,
+        queue_size: int = 2,
+    ) -> Iterator[BatchType]:
+        """Create the data iterator this algorithm needs.
+
+        The default implementation uses the standard ``data_mixer.get_iterator()``.
+        Algorithms that need specialised sampling should override this method.
+        """
+        #修改 ============ GRU：序列采样 batch 缩放 ============
+        # sequence_length>1 时每个 batch 为 (B, T, ...) 连续帧序列，
+        # B = batch_size // T，每批帧数 B×T ≤ batch_size 恒定，
+        # utd 不变 → 每优化步总帧数 = batch_size×utd，计算量与现状完全相同。
+        #结束 ============================================
+        batch_size_eff = max(1, batch_size // self.config.sequence_length)
+        return data_mixer.get_iterator(
+            batch_size=batch_size_eff,
+            sequence_length=self.config.sequence_length,
+            async_prefetch=async_prefetch,
+            queue_size=queue_size,
+        )
+
     def update(self, batch_iterator: Iterator[BatchType]) -> TrainingStats:
         """Run one SAC training step (critic / discrete-critic / actor / temperature).
 
@@ -286,9 +316,29 @@ class SACAlgorithm(RLAlgorithm):
         next_observation_features = batch.get("next_observation_feature")
 
         with torch.no_grad():
-            next_action_preds, next_log_probs, _ = self.policy.actor(
-                next_observations, next_observation_features
-            )
+            #修改 ============ GRU：next 序列还原视图 + done 左移 1 位 ============
+            # next 序列比 observations 右移 1 帧（pos idx+1..idx+T），done 必须左移 1 位：
+            # done_next[t] = done[t+1]（末位无后续帧、值随意——其 td 恰被 (1-done) 掩码），
+            # 否则掩码早 1 帧（静默偏差）：跨 episode 窗口时新 episode 首帧（next 侧）
+            # 被旧 episode 历史污染。td_target 本身仍用 observations 对齐的 done（:313 公式零改动）。
+            # 观测还原 (B, T, ...) 视图；next features 保持 (B*T, C', H', W') 展平态
+            # （与 forward 内部展平后的观测天然对齐）。
+            #结束 ============================================
+            if self.config.sequence_length > 1:
+                B, T = self._seq_shape
+                next_obs_view = {k: v.view(B, T, *v.shape[1:]) for k, v in next_observations.items()}
+                # done 在 _prepare_forward_batch 已展平为 (B*T,)，先还原 (B, T) 再左移
+                done_seq = done.view(B, T)
+                done_next = torch.cat(
+                    [done_seq[:, 1:], torch.zeros(B, 1, device=done.device, dtype=done.dtype)], dim=1
+                )
+                next_action_preds, next_log_probs, _ = self.policy.actor(
+                    next_obs_view, next_observation_features, done=done_next
+                )
+            else:
+                next_action_preds, next_log_probs, _ = self.policy.actor(
+                    next_observations, next_observation_features
+                )
 
             # 2- compute q targets
             q_targets = self._critic_forward(
@@ -412,7 +462,19 @@ class SACAlgorithm(RLAlgorithm):
         observations = batch["state"]
         observation_features = batch.get("observation_feature")
 
-        actions_pi, log_probs, _ = self.policy.actor(observations, observation_features)
+        #修改 ============ GRU：还原序列视图调 actor ============
+        # 跨 episode 窗口时若不带 done 掩码，会把上一 episode 的历史带进
+        # log_probs/Q，而这两处没有 TD 掩码兜底，污染直接进梯度；
+        # 传 done（observations 对齐），掩码时序见 modeling_gaussian_actor.py forward。
+        # log_probs (B*T,) 直接用于损失，critic 前向仍用展平态 observations。
+        #结束 ============================================
+        if self.config.sequence_length > 1:
+            B, T = self._seq_shape
+            obs_view = {k: v.view(B, T, *v.shape[1:]) for k, v in observations.items()}
+            done_view = batch["done"].view(B, T)
+            actions_pi, log_probs, _ = self.policy.actor(obs_view, observation_features, done=done_view)
+        else:
+            actions_pi, log_probs, _ = self.policy.actor(observations, observation_features)
 
         q_preds = self._critic_forward(
             observations=observations,
@@ -432,7 +494,16 @@ class SACAlgorithm(RLAlgorithm):
 
         # calculate temperature loss
         with torch.no_grad():
-            _, log_probs, _ = self.policy.actor(observations, observation_features)
+            #修改 ============ GRU：同 _compute_loss_actor ============
+            # 还原序列视图 + 传 done，避免跨 episode 历史污染 log_probs。
+            #结束 ============================================
+            if self.config.sequence_length > 1:
+                B, T = self._seq_shape
+                obs_view = {k: v.view(B, T, *v.shape[1:]) for k, v in observations.items()}
+                done_view = batch["done"].view(B, T)
+                _, log_probs, _ = self.policy.actor(obs_view, observation_features, done=done_view)
+            else:
+                _, log_probs, _ = self.policy.actor(observations, observation_features)
 
         temperature_loss = (-self.log_alpha.exp() * (log_probs + self.target_entropy)).mean()
         return temperature_loss
@@ -462,6 +533,21 @@ class SACAlgorithm(RLAlgorithm):
     ) -> dict[str, Any]:
         observations = batch["state"]
         next_observations = batch["next_state"]
+        #修改 ============ GRU：序列采样展平 ============
+        # sequence_length>1 时 batch 各键为 (B, T, ...)。展平必须先于
+        # get_observation_features——否则 get_cached_image_features 对 (B,T,C,H,W)
+        # 图像键 cat 出 5D 张量喂给 ResNet10 直接崩溃；展平后 cat 得 4D 正常，
+        # 缓存特征图即 (B*T, C', H', W') 展平态（critic 路径零改动）。
+        # 记录 self._seq_shape，供 loss 函数还原 (B, T, ...) 视图调 actor。
+        #结束 ============================================
+        if self.config.sequence_length > 1:
+            B, T = observations[next(iter(observations))].shape[:2]
+            self._seq_shape = (B, T)
+            observations = {k: v.reshape(B * T, *v.shape[2:]) for k, v in observations.items()}
+            next_observations = {k: v.reshape(B * T, *v.shape[2:]) for k, v in next_observations.items()}
+            batch[ACTION] = batch[ACTION].reshape(B * T, -1)
+            batch["reward"] = batch["reward"].reshape(B * T)
+            batch["done"] = batch["done"].reshape(B * T)
         observation_features, next_observation_features = self.get_observation_features(
             observations, next_observations
         )

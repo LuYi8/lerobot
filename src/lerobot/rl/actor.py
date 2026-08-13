@@ -429,6 +429,12 @@ def act_with_policy(
             episode_total_steps = 0
 
             transition = reset_and_build_transition(online_env, env_processor, action_processor)
+            #修改 ============ GRU：episode 边界清空 hidden ============
+            # use_recurrent=true 时 select_action 持续更新 policy.actor._hidden，
+            # 必须在新 episode 前清零（此处在 update_policy_parameters 拉新权重之后，
+            # 顺序：新权重 + 干净 hidden）。
+            policy.reset()
+            #结束 ============================================
 
         if cfg.env.fps is not None:
             dt_time = time.perf_counter() - start_time

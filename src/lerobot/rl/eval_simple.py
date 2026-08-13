@@ -68,6 +68,11 @@ def main(cfg: TrainRLServerPipelineConfig):
     for ep in range(n_episodes):
 
         transition = reset_and_build_transition(env, env_processor, action_processor)
+        #修改 ============ GRU：episode 边界清空 hidden ============
+        # use_recurrent=true 时 select_action 持续更新 policy.actor._hidden，
+        # 每个 episode 开始前必须清零，否则沿用上一 episode 的历史。
+        policy.reset()
+        #结束 ============================================
 
         obs = transition['observation']
         ep_reward = 0.0

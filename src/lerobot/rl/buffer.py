@@ -231,10 +231,17 @@ class ReplayBuffer:
             self.position = (self.position + 1) % self.capacity
             self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int) -> BatchTransition:
+    def sample(self, batch_size: int, sequence_length: int = 1) -> BatchTransition:
         """Sample a random batch of transitions and collate them into batched tensors."""
         if not self.initialized:
             raise RuntimeError("Cannot sample from an empty buffer. Add transitions first.")
+
+        #修改 ============ GRU：序列采样路由 ============
+        # sequence_length>1 时改走 _sample_sequences（(B, T, ...) 连续帧窗口）；
+        # 否则原逐帧逻辑逐位不变（零回归）。
+        if sequence_length > 1:
+            return self._sample_sequences(batch_size, sequence_length)
+        #结束 ============================================
 
         with self._lock:
             batch_size = min(batch_size, self.size)
@@ -299,11 +306,108 @@ class ReplayBuffer:
             complementary_info=batch_complementary_info,
         )
 
+    #修改 ============ GRU：序列采样 ============
+    def _sample_sequences(self, batch_size: int, sequence_length: int) -> BatchTransition:
+        """Sample ``batch_size`` sequences of ``sequence_length`` consecutive transitions.
+
+        正确性论证（对照现有 sample() 逐条推演，见 gym-hil/上下文归档_SAC增加GRU方案.md 第 4 节）：
+        - 索引范围：未满时窗口必须全落在已写区 [0, size)——
+          optimize_memory 下窗口末帧的 next 是 states[idx+T]，要求 idx+T ≤ size-1
+          （排除"窗口末帧即 buffer 末帧且 done=False"的情形，否则读到未初始化内存）；
+          非 optimize_memory 下 next 独立存储，只需 idx+T-1 ≤ size-1。
+          满时（环形）idx+T-1 ≤ capacity-1，末帧 next 用 (idx+T) % capacity。
+        - episode 边界：允许窗口跨 episode，双兜底——TD 掩码（done 帧 bootstrap
+          被掩，公式逐字沿用现有 :313）与 GRU hidden 清零（新 episode 零历史），
+          无拒绝采样偏差（拒绝采样会系统性偏好长 episode）。
+        - 切片对齐：states[key][i:i+T] 与 next 帧同一数组错位 1（optimize_memory
+          语义），保证 next_state_t ≡ state_{t+1} 逐位一致。
+        """
+        with self._lock:
+            if sequence_length > self.size:
+                raise ValueError(
+                    f"Cannot sample sequences of length {sequence_length} from a buffer of size {self.size}."
+                )
+            batch_size = min(batch_size, self.size // sequence_length)
+            if self.size < self.capacity:
+                # 未满：窗口必须全部落在已写区 [0, size)
+                if self.optimize_memory:
+                    high = self.size - sequence_length  # 末帧 next = states[idx+T]
+                else:
+                    high = self.size - sequence_length + 1  # 末帧 next = next_states[idx+T-1]
+            else:
+                # 满（环形）：窗口不越 capacity，末帧 next 用 (idx+T) % capacity
+                high = self.capacity - sequence_length + 1
+
+            idx = torch.randint(low=0, high=high, size=(batch_size,), device=self.storage_device)
+            windows = idx.unsqueeze(1) + torch.arange(sequence_length, device=self.storage_device).unsqueeze(
+                0
+            )  # (B, T) 位置矩阵
+
+            image_keys = [k for k in self.states if k.startswith(OBS_IMAGE)] if self.use_drq else []
+
+            batch_state = {}
+            batch_next_state = {}
+
+            for key in self.states:
+                batch_state[key] = self.states[key][windows].to(self.device)
+
+                if not self.optimize_memory:
+                    batch_next_state[key] = self.next_states[key][windows].to(self.device)
+                else:
+                    next_windows = (windows + 1) % self.capacity
+                    batch_next_state[key] = self.states[key][next_windows].to(self.device)
+
+            # Sample other tensors
+            batch_actions = self.actions[windows].to(self.device)
+            batch_rewards = self.rewards[windows].to(self.device)
+            batch_dones = self.dones[windows].to(self.device).float()
+            batch_truncateds = self.truncateds[windows].to(self.device).float()
+
+            # Sample complementary_info if available
+            batch_complementary_info = None
+            if self.has_complementary_info:
+                batch_complementary_info = {}
+                for key in self.complementary_info_keys:
+                    batch_complementary_info[key] = self.complementary_info[key][windows].to(self.device)
+
+        if self.use_drq and image_keys:
+            # 与现有逻辑同构：state+next_state 一起增强；序列版先展平 T 维
+            all_images = []
+            for key in image_keys:
+                all_images.append(batch_state[key])
+                all_images.append(batch_next_state[key])
+
+            all_images_tensor = torch.cat(all_images, dim=0).flatten(0, 1)  # (2*B*T, C, H, W)
+            augmented_images = self.image_augmentation_function(all_images_tensor)
+
+            # Split the augmented images back to their sources（还原 (B, T, C, H, W)）
+            n_imgs = batch_size * sequence_length
+            for i, key in enumerate(image_keys):
+                batch_state[key] = augmented_images[i * 2 * n_imgs : (i * 2 + 1) * n_imgs].view(
+                    batch_size, sequence_length, *batch_state[key].shape[2:]
+                )
+                batch_next_state[key] = augmented_images[(i * 2 + 1) * n_imgs : (i + 1) * 2 * n_imgs].view(
+                    batch_size, sequence_length, *batch_next_state[key].shape[2:]
+                )
+
+        return BatchTransition(
+            state=batch_state,
+            action=batch_actions,
+            reward=batch_rewards,
+            next_state=batch_next_state,
+            done=batch_dones,
+            truncated=batch_truncateds,
+            complementary_info=batch_complementary_info,
+        )
+
+    #结束 ============================================
+
     def get_iterator(
         self,
         batch_size: int,
         async_prefetch: bool = True,
         queue_size: int = 2,
+        sequence_length: int = 1,
     ):
         """
         Creates an infinite iterator that yields batches of transitions.
@@ -313,6 +417,7 @@ class ReplayBuffer:
             batch_size (int): Size of batches to sample
             async_prefetch (bool): Whether to use asynchronous prefetching with threads (default: True)
             queue_size (int): Number of batches to prefetch (default: 2)
+            sequence_length (int): Number of consecutive frames per sample (default: 1)
 
         Yields:
             BatchTransition: Batched transitions
@@ -320,15 +425,19 @@ class ReplayBuffer:
         while True:  # Create an infinite loop
             if async_prefetch:
                 # Get the standard iterator
-                iterator = self._get_async_iterator(queue_size=queue_size, batch_size=batch_size)
+                iterator = self._get_async_iterator(
+                    queue_size=queue_size, batch_size=batch_size, sequence_length=sequence_length
+                )
             else:
-                iterator = self._get_naive_iterator(batch_size=batch_size, queue_size=queue_size)
+                iterator = self._get_naive_iterator(
+                    batch_size=batch_size, queue_size=queue_size, sequence_length=sequence_length
+                )
 
             # Yield all items from the iterator
             with suppress(StopIteration):
                 yield from iterator
 
-    def _get_async_iterator(self, batch_size: int, queue_size: int = 2):
+    def _get_async_iterator(self, batch_size: int, queue_size: int = 2, sequence_length: int = 1):
         """
         Create an iterator that continuously yields prefetched batches in a
         background thread. The design is intentionally simple and avoids busy
@@ -338,6 +447,7 @@ class ReplayBuffer:
             batch_size (int): Size of batches to sample.
             queue_size (int): Maximum number of prefetched batches to keep in
                 memory.
+            sequence_length (int): Number of consecutive frames per sample.
 
         Yields:
             BatchTransition: A batch sampled from the replay buffer.
@@ -352,7 +462,7 @@ class ReplayBuffer:
             """Continuously put sampled batches into the queue until shutdown."""
             while not shutdown_event.is_set():
                 try:
-                    batch = self.sample(batch_size)
+                    batch = self.sample(batch_size, sequence_length)
                     # The timeout ensures the thread unblocks if the queue is full
                     # and the shutdown event gets set meanwhile.
                     data_queue.put(batch, block=True, timeout=0.5)
@@ -382,13 +492,14 @@ class ReplayBuffer:
             # Give the producer thread a bit of time to finish.
             producer_thread.join(timeout=1.0)
 
-    def _get_naive_iterator(self, batch_size: int, queue_size: int = 2):
+    def _get_naive_iterator(self, batch_size: int, queue_size: int = 2, sequence_length: int = 1):
         """
         Creates a simple non-threaded iterator that yields batches.
 
         Args:
             batch_size (int): Size of batches to sample
             queue_size (int): Number of initial batches to prefetch
+            sequence_length (int): Number of consecutive frames per sample
 
         Yields:
             BatchTransition: Batch transitions
@@ -399,7 +510,7 @@ class ReplayBuffer:
 
         def enqueue(n):
             for _ in range(n):
-                data = self.sample(batch_size)
+                data = self.sample(batch_size, sequence_length)
                 queue.append(data)
 
         enqueue(queue_size)

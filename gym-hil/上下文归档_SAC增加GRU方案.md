@@ -160,3 +160,25 @@ python -m lerobot.rl.actor --config_path gym-hil/actor_hil_env.json \
 - resume 必须用 checkpoint 内 `train_config.json` + `--resume true`。
 - 修改 `rl/` 或 `policies/gaussian_actor/` 时需同时考虑 actor/learner 两侧一致性。
 - wandb project=`hil_test`；训练/评估命令以 `gym-hil/命令.txt` 与 AGENTS.md 为准。
+
+## 10. 实施记录（2026-08-13，已实施并验证）
+
+**状态**：§3.1-§3.8 全部落地，§6 验证 1-4 全部通过；尚未做真机实验（下一步）。
+
+**与蓝图的两处偏差（验证中发现并修正）**：
+
+| 位置 | 蓝图写法 | 实际实现 | 原因 |
+|---|---|---|---|
+| §3.3 `_init_actor` | 未提 MLP 输入维（隐含假设 recurrent_hidden_size 256 == encoder.output_dim） | use_recurrent 时 `MLP(input_dim=recurrent_hidden_size)` | 本仓库 `latent_dim=64` → `encoder.output_dim=192`（2 图×64+state 64），与 256 不等；蓝图假设在本配置下不成立 |
+| §3.6 `_compute_loss_critic` | 对 (B, T) 的 done 直接 `done[:, 1:]` 左移 | 先 `done.view(B, T)` 再左移 | `_prepare_forward_batch` 已把 done 展平为 (B*T,)，直接左移会 shape 崩溃（验证脚本捕获） |
+
+**§6 验证结果**（测试脚本归档于 `gym-hil/tests/`，重跑命令见各文件头注释）：
+
+1. `py_compile` 8 个改动文件全过。
+2. `verify_sequence_buffer.py`：16 项断言全过——未满/满（环形）/两种 optimize_memory 的窗口越界、`next_state_t ≡ state_{t+1}` 逐位对齐、跨 episode done 标志、`(idx+T)%capacity` 环形索引、`size<T` 抛错、DRQ 增强后 (B,T,C,H,W) 还原、B×T==64、OnlineOfflineMixer 透传。
+3. `verify_zero_regression.py`（需 `git worktree add /tmp/lerobot-orig HEAD` 造改动前代码对比）：`use_recurrent=false` 加载 `output好` checkpoint，`Policy.forward` 的 actions/log_probs/means **逐位一致**；同步迭代器下 `SACAlgorithm.update` 两步 loss **逐位一致**（异步预取线程会导致采样不可复现，对比时必须 `async_prefetch=False`）。
+4. `verify_gru_chain.py`：全过——`sequence_length=8` update 不崩且 loss 有限、B×T==64、select_action 连续两帧 hidden 传递且 `reset()` 后逐位复现、**done 左移掩码回归**（新 episode 首帧 next 侧零历史与全 1 基线逐位一致；误传未左移 done 会被断言捕获）。
+
+**沙箱注意**：CPU 沙箱下 dynamo 无法对 frozen ResNet10 的符号形状做 fake-tensor 推断，验证时需 `use_torch_compile=false`（真机 GPU 训练不受影响，`output好` 即编译开启训出的）。
+
+**遗留**：真机实验（第 5 节命令，双侧同参 CLI 开启，从头训练对比成功率/干预率）与结果回填本文档。

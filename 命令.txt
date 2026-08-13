@@ -22,3 +22,25 @@ python -m lerobot.rl.actor --config_path /home/embody/lerobot/gym-hil/actor_hil_
 
 自定义检查点
 python -m lerobot.rl.eval_simple     --config_path /home/embody/lerobot/gym-hil/actor_hil_env.json     --policy.pretrained_path /home/embody/lerobot/gym-hil/output/checkpoints/006000/pretrained_model     --eval.n_episodes 10     --policy.device cuda
+
+
+【GRU 循环增强实验（R-SAC，use_recurrent，2026-08-13 新增）】
+开关：--policy.policy_kwargs.use_recurrent true（默认 false，行为与原来逐位一致）
+配套：--policy.policy_kwargs.recurrent_hidden_size 256 --policy.policy_kwargs.recurrent_num_layers 1
+      --algorithm.sequence_length 8（序列长度；B = batch_size//T，每批帧数 64 不变）
+注意：actor 与 learner 两侧的 policy.policy_kwargs 与 algorithm.sequence_length 必须一致
+learner:
+python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume false \
+  --policy.policy_kwargs.use_recurrent true \
+  --policy.policy_kwargs.recurrent_hidden_size 256 \
+  --policy.policy_kwargs.recurrent_num_layers 1 \
+  --algorithm.sequence_length 8 2>&1 | tee full_trace.log
+actor:
+python -m lerobot.rl.actor --config_path gym-hil/actor_hil_env.json \
+  --policy.policy_kwargs.use_recurrent true \
+  --policy.policy_kwargs.recurrent_hidden_size 256 \
+  --policy.policy_kwargs.recurrent_num_layers 1 \
+  --algorithm.sequence_length 8 2>&1 | tee actor_trace.log
+评估（同普通流程，policy.pretrained_path 指向开 GRU 的 checkpoint；两侧参数仍须一致）
+实验细节与结论见 gym-hil/上下文归档_SAC增加GRU方案.md 第 5 节
+

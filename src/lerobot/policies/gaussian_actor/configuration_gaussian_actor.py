@@ -73,6 +73,15 @@ class PolicyConfig:
     std_min: float = 1e-5
     std_max: float = 10.0
     init_final: float = 0.05
+    #修改 ============ GRU 循环增强（R-SAC） ============
+    # use_recurrent=true 时 actor 在 encoder 与高斯头之间插入 GRU，
+    # 策略从图像/状态历史推断目标运动，动作更平滑；默认关闭，
+    # 行为与原前馈实现逐位一致（旧 checkpoint/resume 完全兼容）。
+    # 经 _init_actor 的 **asdict(self.config.policy_kwargs) 自动流入 Policy.__init__。
+    use_recurrent: bool = False
+    recurrent_hidden_size: int = 256
+    recurrent_num_layers: int = 1
+    #结束 ============================================
 
 
 @PreTrainedConfig.register_subclass("gaussian_actor")
