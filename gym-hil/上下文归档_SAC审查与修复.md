@@ -105,7 +105,7 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 - Bug 2：不触发；启用即 shape 崩溃（功能性问题，非性能）。
 - Bug 3/4/5：修复前后行为一致（Bug 3 配置 1e-5/5 新旧公式 allclose=True；Bug 4 配置恒 true 本就走 tanh；Bug 5 仅注释）。
 - is_intervention：grep 确认无 loss 使用；未来若在 loss 加权需先修半批错位。
-- Q 统计：num_critics=1 才 IndexError（配置为 2）。
+- Q 统计（本地改动，bac457c）：num_critics=1 时 `q_preds[1]` 越界（当前配置 2，不触发）；且 `_compute_loss_critic` 返回 2 元组与上游测试契约不符 → 10 个上游测试失败（详见 §6 待办 6），**不影响真实训练**（wandb 侧一直正常）。
 - actor/learner 配置不一致：actor 不训练，训练用 learner 侧 0.05/2/8000；actor 侧 0.005/1/5000 为死值（但会白建 critic 网络耗显存；与 AGENTS.md"必须一致"约定冲突）。
 - NaN 检查范围：learner 侧 `check_nan_in_transition`（:963）全量兜底。
 
@@ -133,6 +133,16 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 3. **（推荐，效率收益最大）优化 checkpoint 保存耗时**：to_lerobot_dataset 全量写盘阻塞训练（见第 3 节），改异步保存/只存增量/去视频化。
 4. （可选）修 Bug 2：若计划启用离散夹爪（num_discrete_actions），需配套改 output action shape→[3]、action stats→3 维、`update()` 的 include_complementary_info 全改 True。~~std clamp 改为 log 空间~~（已完成，见第 1 节 Bug 3）。
 5. ~~（可选）把 `use_torch_compile` 配置改为 false~~（已完成：保留 true、改注释）。
+6. **（2026-08-13 新增，可选）修复上游测试失败（Q 统计契约，10 个失败全源于此）**：
+   - 现象：lero6 环境 `pytest tests/policies/test_gaussian_actor_policy.py -q` 10 failed / 77 passed；HEAD 与 GRU 改动后（cf72140）失败集合逐项一致，**与 GRU 无关**（GRU 未改 `_compute_loss_critic` 返回结构，已用 worktree 实测确认）。
+   - 根因（全部来自 bac457c 的 Q 统计本地改动）：
+     - 类 A（8 个）：`_compute_loss_critic` 返回 `(critics_loss, q_stats)` 2 元组，上游测试按单 Tensor 断言 → `AttributeError: 'tuple' object has no attribute 'item'/'shape'`（through_sac×2、visual_input×2、pretrained_encoder×2、shared_encoder、discrete_critic；convnext 用例报错点一致，模型从 HF 缓存加载成功，与联网无关）。
+     - 类 B（2 个）：q_stats 硬编码 `q_preds[1]`（Q2_mean/Q2_std）在 `num_critics=1` 时 IndexError（`test_sac_algorithm_with_critics_number_of_heads[1]`；`[3]` 无越界但仍有元组问题）。
+   - 修法（推荐 a+b）：
+     a. 上游测试适配本地契约：`critic_loss, _ = algorithm._compute_loss_critic(...)`（tests/policies/test_gaussian_actor_policy.py 共 5 处：:251/:283/:323/:349/:379 附近）；
+     b. q_stats 加 num_critics 防御：`q_preds[1]` 仅当 `num_critics > 1` 时记录，否则 Q2_mean/Q2_std 省略（或记 nan）。
+   - 验证：`/home/embody/miniconda3/envs/lero6/bin/python -m pytest tests/policies/test_gaussian_actor_policy.py -q` 应清零失败（不回归其他测试文件）。
+   - 注意：这是测试契约问题；若不想动上游测试文件，也可在本地对 `_compute_loss_critic` 加"单 Tensor 兼容返回"（不推荐，与 update() 解包冲突）。
 
 ## 7. 仓库约定提醒（详见 AGENTS.md）
 
