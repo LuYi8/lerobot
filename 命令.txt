@@ -3,9 +3,10 @@ python -m lerobot.rl.gym_manipulator --config_path /home/embody/lerobot/gym-hil/
 
 
 learner: 
+从头开始(删除output)
 python -m lerobot.rl.learner --config_path /home/embody/lerobot/gym-hil/train_hil_env.json --resume false 2>&1 | tee full_trace.log
 
-
+继续训练
 python -m lerobot.rl.learner --config_path /home/embody/lerobot/gym-hil/output/checkpoints/last/pretrained_model/train_config.json --resume true 2>&1 | tee full_trace.log
 
 actor:
