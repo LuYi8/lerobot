@@ -423,6 +423,19 @@ class DiscreteCritic(nn.Module):
         return self.output_layer(self.net(obs_enc))
 
 
+#修改 ============ GRU 防 cuDNN 参数展平 ============
+# torch≥2.x 在 CUDA 上会于构造/`.to(device)` 时把 RNN 权重原地展平为单个共享
+# storage 的多个 view（_init_flat_weights → flatten_parameters → _cudnn_rnn_flatten_weight）。
+# 共享存储导致 policy.save_pretrained 存 checkpoint 时 safetensors 拒绝保存
+# （RuntimeError: no suitable name to keep ... {'actor.gru.weight_ih_l0'}）。
+# 子类化把 flatten 置为空操作：4 个权重各自独立 storage，数值完全不变
+# （flatten 仅是内存布局优化，本实验小 GRU 上无性能收益损失）。
+#结束 ============================================
+class _NonFlatteningGRU(nn.GRU):
+    def flatten_parameters(self) -> None:
+        return
+
+
 class Policy(nn.Module):
     def __init__(
         self,
@@ -461,7 +474,10 @@ class Policy(nn.Module):
         #修改 ============ GRU 循环 ============
         self.use_recurrent = use_recurrent
         if self.use_recurrent:
-            self.gru = nn.GRU(
+            # 用 _NonFlatteningGRU 而非 nn.GRU：CUDA 上 nn.GRU 会把参数展平成
+            # 共享 storage 的 view，导致 checkpoint 存 safetensors 时直接报错
+            # （详见 _NonFlatteningGRU 上方注释）。
+            self.gru = _NonFlatteningGRU(
                 encoder.output_dim, recurrent_hidden_size, recurrent_num_layers, batch_first=True
             )
         self._hidden = None
