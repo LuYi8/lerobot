@@ -90,8 +90,12 @@ class SACAlgorithm(RLAlgorithm):
         self.critic_target = CriticEnsemble(encoder=encoder, ensemble=target_heads)
         self.critic_target.load_state_dict(self.critic_ensemble.state_dict())
 
+        #修改 ============ torch.compile 注释修正 ============
         # TODO(Khalil): Investigate and fix torch.compile
-        # NOTE: torch.compile is disabled, policy does not converge when enabled.
+        # 上游注释称 "torch.compile is disabled, policy does not converge when enabled"，
+        # 但本仓库实测（gym-hil HIL-SAC 抓方块）use_torch_compile=true 训练约 6000 优化步
+        # 成功率约 60%，可正常收敛。保留编译并更正注释，避免误导。
+        #结束 ============================================
         if self.config.use_torch_compile:
             self.critic_ensemble = torch.compile(self.critic_ensemble)
             self.critic_target = torch.compile(self.critic_target)

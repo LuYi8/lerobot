@@ -464,8 +464,15 @@ class Policy(nn.Module):
         else:
             std = self.fixed_std.expand_as(means)
 
-        # Build transformed distribution
-        dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
+        #修改 ============ use_tanh_squash 生效 ============
+        # 原代码无条件使用 TanhMultivariateNormalDiag，use_tanh_squash=False 时设置无效。
+        # 关闭 tanh squash 时退化为普通对角高斯（构造方式与 TanhMultivariateNormalDiag
+        # 的 base_dist 一致）；当前配置 policy_kwargs.use_tanh_squash=true，行为不变。
+        if self.use_tanh_squash:
+            dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
+        else:
+            dist = MultivariateNormal(loc=means, covariance_matrix=torch.diag_embed(std))
+        #结束 ============================================
 
         # Sample actions (reparameterized)
         actions = dist.rsample()

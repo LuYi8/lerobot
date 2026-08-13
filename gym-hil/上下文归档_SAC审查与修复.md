@@ -11,7 +11,9 @@
 - 跑验证脚本：`cd /home/embody/lerobot && /home/embody/miniconda3/envs/lero6/bin/python - <<'EOF' ... EOF`（记得 `sys.path.insert(0, "src")`）
 - 上次成功训练的完整输出：`gym-hil/output好/`（checkpoints 001000~005000，`last` 符号链接可用）；当前 `gym-hil/output` 不存在（按约定删除后从头训练）
 
-## 1. 已完成的修改（已实现并验证，未提交）
+## 1. 已完成的修改
+
+> Bug 1 修复已于 2026-08-13 提交（commit b3c05a5，与 batch_size 128→64、AGENTS.md、本归档文档同批）。
 
 **Bug 1 修复：resume 时 learner 不恢复策略权重** —— `src/lerobot/rl/learner.py:708-717`
 
@@ -26,6 +28,16 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 - resume 命令不变（见 AGENTS.md）：learner 用 checkpoint 的 `train_config.json --resume true`；actor 加 `--policy.pretrained_path gym-hil/output/checkpoints/last/pretrained_model`。
 - 注意：`from_pretrained` 里 `policy.to(config.device)`（device=cuda），须在有 GPU 的机器上跑（正常训练环境 OK）。
 
+**Bug 4 修复：use_tanh_squash 从未被读取** —— `modeling_gaussian_actor.py:466-475`（已实现并验证，待提交）
+
+`Policy.forward` 新增分支：`use_tanh_squash=True` 用 `TanhMultivariateNormalDiag`（行为与原来完全一致，配置均显式设 true）；`False` 时退化为普通对角高斯 `MultivariateNormal(loc, diag_embed(std))`（与 Tanh 分支 base_dist 同构）。
+- 验证：沙箱实测 tanh 分支 max|a|=0.98（≤1）、raw 分支 max|a|=3.25（无界）、log_prob 有限、形状不变；`py_compile` 通过。
+- 注意：若以后把配置改成 `false`，actor 输出将无界，需同步确认动作归一化链路（当前 env 动作空间 [-1,1]，依赖 tanh squash）。
+
+**Bug 5 修复：torch.compile 注释与配置矛盾** —— `sac_algorithm.py:93-97`（已实现并验证，待提交）
+
+按用户决定**保留编译、改注释**：`use_torch_compile: true` 与上次成功训练（6000 步 60% 成功率）一致；删除上游 "policy does not converge when enabled" 旧注释，改为说明本仓库实测可正常收敛，消除误导。
+
 ## 2. 审查结论：未修复的 bug（按严重度）
 
 ### Bug 2（潜在，当前配置 null 未触发）：启用 num_discrete_actions 时链路维度不一致
@@ -39,11 +51,11 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 - 配置传 `std_min=1e-5, std_max=5`（正值、按 std 解释），`clamp(exp(x),a,b)=exp(clamp(x,log a,log b))` 恰好等价 → 当前功能正确。
 - 类默认值 `-5/2` 若被用：std 上限压到 2、下限失效（std 可趋 0 → 策略过早确定化）。建议改 `torch.exp(torch.clamp(log_std, math.log(std_min), math.log(std_max)))` 或把默认值改正值。
 
-### Bug 4（死配置）：use_tanh_squash 从未被读取
-- `modeling_gaussian_actor.py:420-423` 存了 `self.use_tanh_squash`，`forward`（:468）无条件用 `TanhMultivariateNormalDiag`，设 False 无效果。
+### Bug 4（已修复，见第 1 节）：use_tanh_squash 从未被读取
+- ~~`modeling_gaussian_actor.py:420-423` 存了 `self.use_tanh_squash`，`forward`（:468）无条件用 `TanhMultivariateNormalDiag`，设 False 无效果。~~ 已修复：forward 按 flag 分支，配置均 true，行为不变。
 
-### Bug 5（配置/注释矛盾）：torch.compile
-- `sac_algorithm.py:93-97` 注释 "torch.compile is disabled, policy does not converge when enabled"，但两个配置 `use_torch_compile: true` 且代码真的会 compile critic。若"不收敛"是实测结论，配置应改 false，否则注释误导。
+### Bug 5（已修复，见第 1 节）：torch.compile
+- ~~`sac_algorithm.py:93-97` 注释 "torch.compile is disabled, policy does not converge when enabled"，但两个配置 `use_torch_compile: true` 且代码真的会 compile critic。~~ 已修复：保留编译（上次成功训练即 true），注释改为实测结论。
 
 ### Bug 6（近似，影响小）：满 buffer 时 next_state 跨 episode 污染
 - `buffer.py:256-257`：`optimize_memory=True` 时 `next_idx=(idx+1)%capacity`，buffer 写满（8000）后位置末位↔位置 0 之间、episode 边界与环形位置不对齐处，bootstrap 目标用到别的 episode 状态。done=True 被掩码不受影响；truncated 样本受影响。DrQ 系常见近似。
@@ -75,10 +87,10 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 
 ## 5. 下一步建议（待办，按优先级）
 
-1. 提交 Bug 1 修复（分支 `原始SAC`，中文提交信息，如"修复resume时learner不恢复策略权重导致续训从零开始"）。
+1. ~~提交 Bug 1 修复~~（已完成，b3c05a5）。
 2. 续训验证：按 AGENTS.md 命令 resume 一次，对比 `0005000` 与 `last` checkpoint 的 eval 成功率，确认续训起点正确。
 3. （可选）修 Bug 2/3：若计划启用离散夹爪（num_discrete_actions），需配套改 output action shape→[3]、action stats→3 维、`update()` 的 include_complementary_info 全改 True；std clamp 建议改为 log 空间。
-4. （可选）把 `use_torch_compile` 配置改为 false 以匹配代码注释，或删掉过时注释。
+4. ~~（可选）把 `use_torch_compile` 配置改为 false~~（已完成：保留 true、改注释）。
 5. （可选）优化 checkpoint 保存耗时（to_lerobot_dataset 全量写盘）。
 
 ## 6. 仓库约定提醒（详见 AGENTS.md）
