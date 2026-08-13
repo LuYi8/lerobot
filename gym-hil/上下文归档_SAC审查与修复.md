@@ -1,7 +1,7 @@
-# 上下文归档：SAC 实现审查 + Bug 1 修复（2026-08-13）
+# 上下文归档：SAC 审查与修复（2026-08-13）
 
 > 本文件用于跨对话窗口续接。新窗口先读本文件 + `AGENTS.md`，再从"待办/下一步"继续。
-> 相关会话任务：审阅五个 SAC 相关代码文件是否有 bug → 已修复 Bug 1（resume 权重恢复）。
+> 相关会话任务：审阅五个 SAC 相关代码文件是否有 bug → 已修复 Bug 1/3/4/5；2026-08-13 完成 Bug 影响分级评估（第 3 节）。
 
 ## 0. 环境信息（沙箱验证用）
 
@@ -28,17 +28,17 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 - resume 命令不变（见 AGENTS.md）：learner 用 checkpoint 的 `train_config.json --resume true`；actor 加 `--policy.pretrained_path gym-hil/output/checkpoints/last/pretrained_model`。
 - 注意：`from_pretrained` 里 `policy.to(config.device)`（device=cuda），须在有 GPU 的机器上跑（正常训练环境 OK）。
 
-**Bug 4 修复：use_tanh_squash 从未被读取** —— `modeling_gaussian_actor.py:466-475`（已实现并验证，待提交）
+**Bug 4 修复：use_tanh_squash 从未被读取** —— `modeling_gaussian_actor.py:466-475`（已提交 84443a7）
 
 `Policy.forward` 新增分支：`use_tanh_squash=True` 用 `TanhMultivariateNormalDiag`（行为与原来完全一致，配置均显式设 true）；`False` 时退化为普通对角高斯 `MultivariateNormal(loc, diag_embed(std))`（与 Tanh 分支 base_dist 同构）。
 - 验证：沙箱实测 tanh 分支 max|a|=0.98（≤1）、raw 分支 max|a|=3.25（无界）、log_prob 有限、形状不变；`py_compile` 通过。
 - 注意：若以后把配置改成 `false`，actor 输出将无界，需同步确认动作归一化链路（当前 env 动作空间 [-1,1]，依赖 tanh squash）。
 
-**Bug 5 修复：torch.compile 注释与配置矛盾** —— `sac_algorithm.py:93-97`（已实现并验证，待提交）
+**Bug 5 修复：torch.compile 注释与配置矛盾** —— `sac_algorithm.py:93-97`（已提交 84443a7）
 
 按用户决定**保留编译、改注释**：`use_torch_compile: true` 与上次成功训练（6000 步 60% 成功率）一致；删除上游 "policy does not converge when enabled" 旧注释，改为说明本仓库实测可正常收敛，消除误导。
 
-**Bug 3 修复：std clamp 语义与注释不符** —— `modeling_gaussian_actor.py`（已实现并验证，待提交）
+**Bug 3 修复：std clamp 语义与注释不符** —— `modeling_gaussian_actor.py`（已提交 6c9c4f6）
 
 三处改动（均带 `#修改` 标记）：
 - `forward`（~:465-478）：clamp 从 std 空间改为 **log 空间** `std = exp(clamp(log_std, log(std_min), log(std_max)))`，与注释声称的 JAX 语义（clamp log_std）一致；`clamp(exp(x),a,b)=exp(clamp(x,log a,log b))`，当前配置 1e-5/5 行为**完全不变**（实测 allclose=True）。
@@ -74,7 +74,42 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 - 两配置算法超参不一致：`critic_target_update_weight` actor=0.005 vs learner=0.05；`policy_update_freq` 1 vs 2；buffer 容量 5000 vs 8000——不影响 gRPC 协议（actor 不训练），但与 AGENTS.md"必须一致"说法冲突。
 - `sac_algorithm.py:335-344` Q 统计假设 `num_critics ≥ 2`（设 1 会 IndexError）。
 
-## 3. 已排查确认没问题（避免下个窗口重复排查）
+## 3. Bug 影响分级评估（SAC 性能视角，2026-08-13）
+
+> 维度区分：**算法质量**（同样优化步数下模型好坏）vs **训练效率**（同样墙钟时间能训多少步）。HIL 训练预算按墙钟算，效率问题会传导为最终模型性能损失。
+> 注：原"轻微/提示"清单中的 save 阻塞一项，从训练效率视角重新评估为**严重**。
+
+| 问题 | 状态 | 影响 | 证据 |
+|---|---|---|---|
+| Bug 1 resume 不恢复权重 | 已修复 | 🔴 严重（算法质量） | 续训被随机权重覆盖，从零开始 |
+| checkpoint 全量写盘阻塞 | 未修复 | 🔴 严重（训练效率） | learner.py:636/643 同步 to_lerobot_dataset |
+| Bug 6 next_state 跨 episode 污染 | 未修复 | 🟡 轻微 | ~1.5-2.5% 样本 Q 目标带噪声 |
+| Bug 2 离散动作维度 | 未修复 | ⚪ 不影响（未启用；启用必崩） | num_discrete_actions: null |
+| Bug 3/4/5 | 已修复 | ⚪ 不影响 | 修复前后行为逐位一致（Bug 3 allclose 实测） |
+| is_intervention 半批错位 | 未修复 | ⚪ 不影响 | 无任何 loss 读取（仅 actor.py:365-374 写入） |
+| Q 统计 num_critics≥2 | 未修复 | ⚪ 不影响 | 配置 num_critics=2 |
+| actor/learner 算法配置不一致 | 未修复 | ⚪ 不影响 | actor 侧 make_algorithm 仅 load_weights 用，从不 update() |
+| NaN 仅查 state / step0 保存 | 未修复 | ⚪ 不影响 | learner 全量兜底 / 单次开销小 |
+
+### 严重项
+
+1. **Bug 1（已修复，算法质量）**：learner 启动即推随机权重，覆盖 actor 真权重 → 续训从零开始、critic 与随机 encoder 不匹配。修复验证 62/62 键 diff=0。
+2. **checkpoint 保存阻塞（未修复，训练效率，当前最大痛点）**：每 `save_freq=1000` 优化步同步写全量 buffer（在线 8000+离线 2000 帧 ×2 相机视频编码），一次几十秒~几分钟。learner 主循环无条件 `training_step`（:418，GPU 多快训多快），估算 ~3-10 步/秒 → 每 ~100-300 秒卡一次，墙钟吞吐损失 30-50%+；保存期间不推权重给 actor、transitions 队列积压。优化方向：异步线程/进程保存、只存最近 N 步、去视频化（buffer 用状态重放恢复）、或 `--save_checkpoint false` + wandb 监控。
+
+### 轻微项
+
+3. **Bug 6（未修复）**：`optimize_memory=True` 硬编码（learner.py:817/836/873），环形边界处 next_state 指向别的 episode：每 episode（~80 步）约 1-2 个样本被污染（被覆盖块前一个位置 + truncated 末尾样本；done=True 被掩码）。错误 next_state 的 Q' 期望为随机噪声而非系统偏差 → 训练略慢、Q 略噪，不改变收敛方向。
+
+### 不影响项（当前配置下）
+
+- Bug 2：不触发；启用即 shape 崩溃（功能性问题，非性能）。
+- Bug 3/4/5：修复前后行为一致（Bug 3 配置 1e-5/5 新旧公式 allclose=True；Bug 4 配置恒 true 本就走 tanh；Bug 5 仅注释）。
+- is_intervention：grep 确认无 loss 使用；未来若在 loss 加权需先修半批错位。
+- Q 统计：num_critics=1 才 IndexError（配置为 2）。
+- actor/learner 配置不一致：actor 不训练，训练用 learner 侧 0.05/2/8000；actor 侧 0.005/1/5000 为死值（但会白建 critic 网络耗显存；与 AGENTS.md"必须一致"约定冲突）。
+- NaN 检查范围：learner 侧 `check_nan_in_transition`（:963）全量兜底。
+
+## 4. 已排查确认没问题（避免下个窗口重复排查）
 
 - **图像尺度链路一致**：env uint8[0,255] → `VanillaObservationProcessorStep`（observation_processor.py:89-90）转 float/255 → buffer 存 [0,1]；`to_lerobot_dataset` 存 [0,1]（writer 转 uint8 视频）；`LeRobotDataset` 读回默认 float[0,1]（video_utils.py decode 默认 return_uint8=False）；MEAN_STD 统计（mean≈0.27）同为 [0,1] 尺度。✓
 - **动作不归一化**：`trainer.py` 的 `preprocess_rl_batch` 只处理 observation（state/next_state），buffer 里是原始 env 空间动作（连续 [-1,1]、夹爪 0~2）→ 离散 gather 的 `round().long()` 得到正确索引。✓
@@ -82,7 +117,7 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 - **checkpoint 数据集图像读回 [0,1]**，与在线缓冲一致，resume 后两 buffer 尺度统一。✓
 - **actor/learner policy 结构一致**（input/output features、vision_encoder=/home/embody/lerobot/resnet10、freeze、shared_encoder、policy_kwargs），协议只需 actor+discrete_critic 权重。✓
 
-## 4. 关键代码定位（本次审查覆盖）
+## 5. 关键代码定位（本次审查覆盖）
 
 - `src/lerobot/rl/actor.py`（:322-330 连续/离散反归一化本地修改；:395 episode 结束取权重）
 - `src/lerobot/rl/buffer.py`（:241-257 sample/next_idx；:505-641 to_lerobot_dataset 图像归一化本地修改；:643-764 _lerobotdataset_to_transitions）
@@ -91,15 +126,15 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 - `src/lerobot/policies/gaussian_actor/modeling_gaussian_actor.py`（:50-96 actor 构造/select_action；:446-476 forward 含 std clamp；:633-666 TanhMultivariateNormalDiag）
 - 上下游已核对：`processor/hil_processor.py`（GymHILAdapter/Intervention/TimeLimit）、`processor/normalize_processor.py`（无 /255）、`processor/observation_processor.py`（Vanilla 做 /255）、`datasets/dataset_reader.py`（视频读回 float[0,1]、标量挤压）、`gym-hil/gym_hil/`（环境、wrappers）、`rl/data_sources/data_mixer.py`、`rl/trainer.py`
 
-## 5. 下一步建议（待办，按优先级）
+## 6. 下一步建议（待办，按优先级）
 
 1. ~~提交 Bug 1 修复~~（已完成，b3c05a5）。
 2. 续训验证：按 AGENTS.md 命令 resume 一次，对比 `0005000` 与 `last` checkpoint 的 eval 成功率，确认续训起点正确。
-3. （可选）修 Bug 2：若计划启用离散夹爪（num_discrete_actions），需配套改 output action shape→[3]、action stats→3 维、`update()` 的 include_complementary_info 全改 True。~~std clamp 改为 log 空间~~（已完成，见第 1 节 Bug 3）。
-4. ~~（可选）把 `use_torch_compile` 配置改为 false~~（已完成：保留 true、改注释）。
-5. （可选）优化 checkpoint 保存耗时（to_lerobot_dataset 全量写盘）。
+3. **（推荐，效率收益最大）优化 checkpoint 保存耗时**：to_lerobot_dataset 全量写盘阻塞训练（见第 3 节），改异步保存/只存增量/去视频化。
+4. （可选）修 Bug 2：若计划启用离散夹爪（num_discrete_actions），需配套改 output action shape→[3]、action stats→3 维、`update()` 的 include_complementary_info 全改 True。~~std clamp 改为 log 空间~~（已完成，见第 1 节 Bug 3）。
+5. ~~（可选）把 `use_torch_compile` 配置改为 false~~（已完成：保留 true、改注释）。
 
-## 6. 仓库约定提醒（详见 AGENTS.md）
+## 7. 仓库约定提醒（详见 AGENTS.md）
 
 - 本地改动用 `#修改 ... #结束` / `#===` 注释标记；本次改动已带标记。
 - 分支名/提交信息用中文；实验命令更新到 `gym-hil/命令.txt`。
