@@ -38,6 +38,14 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 
 按用户决定**保留编译、改注释**：`use_torch_compile: true` 与上次成功训练（6000 步 60% 成功率）一致；删除上游 "policy does not converge when enabled" 旧注释，改为说明本仓库实测可正常收敛，消除误导。
 
+**Bug 3 修复：std clamp 语义与注释不符** —— `modeling_gaussian_actor.py`（已实现并验证，待提交）
+
+三处改动（均带 `#修改` 标记）：
+- `forward`（~:465-478）：clamp 从 std 空间改为 **log 空间** `std = exp(clamp(log_std, log(std_min), log(std_max)))`，与注释声称的 JAX 语义（clamp log_std）一致；`clamp(exp(x),a,b)=exp(clamp(x,log a,log b))`，当前配置 1e-5/5 行为**完全不变**（实测 allclose=True）。
+- `Policy.__init__` 默认值 `-5/2` → `1e-5/10.0`（与 PolicyConfig 一致）：旧默认按 std 解释时下限失效（std 可趋 0 → 策略过早确定化）、上限压到 2。
+- 新增 `import math`。
+- resume 兼容性已确认：`output好` 全部 checkpoint 的 config 里 std_min/std_max 均为正数（1e-5/5），不会触发 log(负数) 崩溃。
+
 ## 2. 审查结论：未修复的 bug（按严重度）
 
 ### Bug 2（潜在，当前配置 null 未触发）：启用 num_discrete_actions 时链路维度不一致
@@ -46,10 +54,8 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 - 当前 `gym-hil/*.json` 均为 `num_discrete_actions: null`（夹爪当连续维 [0,2]），所以能跑。若启用：需 `output_features.action.shape=[3]` + 3 维 action stats + 相应切片，否则必崩。
 - 连带问题：`sac_algorithm.py:203` UTD 循环 `include_complementary_info=True`，:222 最后一轮 `False` → 启用离散 critic 时最后一次更新丢夹爪惩罚项（训练目标不一致）。
 
-### Bug 3（配置恰好正确，默认参数是雷）：std clamp 语义与注释不符
-- `modeling_gaussian_actor.py:461-463`：`std = torch.clamp(std, std_min, std_max)`，注释说 "Match JAX default clip"（JAX 是 clamp log_std ∈ [-5,2]）。
-- 配置传 `std_min=1e-5, std_max=5`（正值、按 std 解释），`clamp(exp(x),a,b)=exp(clamp(x,log a,log b))` 恰好等价 → 当前功能正确。
-- 类默认值 `-5/2` 若被用：std 上限压到 2、下限失效（std 可趋 0 → 策略过早确定化）。建议改 `torch.exp(torch.clamp(log_std, math.log(std_min), math.log(std_max)))` 或把默认值改正值。
+### Bug 3（已修复，见第 1 节）：std clamp 语义与注释不符
+- ~~`modeling_gaussian_actor.py:461-463`：`std = torch.clamp(std, std_min, std_max)`，注释说 "Match JAX default clip"（JAX 是 clamp log_std ∈ [-5,2])。~~ 已修复：clamp 改 log 空间（行为不变），类默认值 -5/2 改为 1e-5/10.0（与 PolicyConfig 一致）。
 
 ### Bug 4（已修复，见第 1 节）：use_tanh_squash 从未被读取
 - ~~`modeling_gaussian_actor.py:420-423` 存了 `self.use_tanh_squash`，`forward`（:468）无条件用 `TanhMultivariateNormalDiag`，设 False 无效果。~~ 已修复：forward 按 flag 分支，配置均 true，行为不变。
@@ -89,7 +95,7 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 
 1. ~~提交 Bug 1 修复~~（已完成，b3c05a5）。
 2. 续训验证：按 AGENTS.md 命令 resume 一次，对比 `0005000` 与 `last` checkpoint 的 eval 成功率，确认续训起点正确。
-3. （可选）修 Bug 2/3：若计划启用离散夹爪（num_discrete_actions），需配套改 output action shape→[3]、action stats→3 维、`update()` 的 include_complementary_info 全改 True；std clamp 建议改为 log 空间。
+3. （可选）修 Bug 2：若计划启用离散夹爪（num_discrete_actions），需配套改 output action shape→[3]、action stats→3 维、`update()` 的 include_complementary_info 全改 True。~~std clamp 改为 log 空间~~（已完成，见第 1 节 Bug 3）。
 4. ~~（可选）把 `use_torch_compile` 配置改为 false~~（已完成：保留 true、改注释）。
 5. （可选）优化 checkpoint 保存耗时（to_lerobot_dataset 全量写盘）。
 

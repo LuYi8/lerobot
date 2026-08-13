@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Callable
 from dataclasses import asdict
 
@@ -404,8 +405,13 @@ class Policy(nn.Module):
         encoder: GaussianActorObservationEncoder,
         network: nn.Module,
         action_dim: int,
-        std_min: float = -5,
-        std_max: float = 2,
+        #修改 ============ std 边界默认值修正 ============
+        # 原默认值 -5/2 是 JAX log_std 空间的取值，被 std 空间 clamp 使用后：
+        # 下限失效（std 可趋 0 → 策略过早确定化）、上限压到 2，是潜伏的雷。
+        # 改为与 PolicyConfig（configuration_gaussian_actor.py）一致的 std 空间正数默认值。
+        #结束 ============================================
+        std_min: float = 1e-5,
+        std_max: float = 10.0,
         fixed_std: torch.Tensor | None = None,
         init_final: float | None = None,
         use_tanh_squash: bool = False,
@@ -459,8 +465,14 @@ class Policy(nn.Module):
         # Compute standard deviations
         if self.fixed_std is None:
             log_std = self.std_layer(outputs)
-            std = torch.exp(log_std)  # Match JAX "exp"
-            std = torch.clamp(std, self.std_min, self.std_max)  # Match JAX default clip
+            #修改 ============ std clamp 改为 log 空间 ============
+            # 原代码对 exp 后的 std 做 clamp，注释却声称 "Match JAX default clip"——
+            # JAX 实际 clamp 的是 log_std ∈ [-5,2]。且类默认值 -5/2 按 std 解释时
+            # 下限失效（std 可趋 0 → 策略过早确定化）、上限压到 2。
+            # 现按 JAX 语义在 log 空间 clamp，std_min/std_max 仍按 std 正值解释：
+            # clamp(exp(x),a,b)=exp(clamp(x,log a,log b))，当前配置 1e-5/5 行为不变。
+            #结束 ============================================
+            std = torch.exp(torch.clamp(log_std, math.log(self.std_min), math.log(self.std_max)))
         else:
             std = self.fixed_std.expand_as(means)
 
