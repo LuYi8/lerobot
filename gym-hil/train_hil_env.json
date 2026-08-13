@@ -4,7 +4,7 @@
 
     "seed": 1000,
     "num_workers": 12,
-    "batch_size": 128,
+    "batch_size": 64,
     "steps": 99000,
     "log_freq": 10,
     "save_checkpoint": true,

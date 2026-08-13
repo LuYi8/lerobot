@@ -706,6 +706,14 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
 
     # Ensure resume flag is set in returned config
     checkpoint_cfg.resume = True
+    #修改 ============ resume 恢复策略权重 ============
+    # 不设置 pretrained_path 时，make_policy 会随机初始化 actor/encoder/discrete_critic，
+    # 且 learner 启动即把随机权重推给 actor（每个 episode 结束时被 actor 取走），
+    # 覆盖 actor 端 --policy.pretrained_path 加载的真实权重，导致"断点续训"实际从零开始。
+    # 这里把 pretrained_path 指向 checkpoint 的 pretrained_model 目录，make_policy 将走
+    # from_pretrained 分支恢复全部策略权重（encoder 也随 policy 一起恢复，与 critic 匹配）。
+    checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_MODEL_DIR)
+    #结束 ============================================
     return checkpoint_cfg
 
 
