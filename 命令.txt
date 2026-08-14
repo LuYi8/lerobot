@@ -22,6 +22,7 @@ python -m lerobot.rl.actor --config_path /home/embody/lerobot/gym-hil/actor_hil_
 
 自定义检查点
 python -m lerobot.rl.eval_simple     --config_path /home/embody/lerobot/gym-hil/actor_hil_env.json     --policy.pretrained_path /home/embody/lerobot/gym-hil/output/checkpoints/006000/pretrained_model     --eval.n_episodes 10     --policy.device cuda
+python -m lerobot.rl.eval_simple     --config_path /home/embody/lerobot/gym-hil/actor_hil_env.json     --policy.pretrained_path /home/embody/lerobot/gym-hil/output/checkpoints/014000/pretrained_model     --eval.n_episodes 100     --policy.device cuda
 
 
 【GRU 循环增强实验（R-SAC，use_recurrent，2026-08-13 新增）】
@@ -30,17 +31,53 @@ python -m lerobot.rl.eval_simple     --config_path /home/embody/lerobot/gym-hil/
       --algorithm.sequence_length 8（序列长度；B = batch_size//T，每批帧数 64 不变）
 注意：actor 与 learner 两侧的 policy.policy_kwargs 与 algorithm.sequence_length 必须一致
 learner:
+
+从头训练（删除 output）
 python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume false \
   --policy.policy_kwargs.use_recurrent true \
   --policy.policy_kwargs.recurrent_hidden_size 256 \
   --policy.policy_kwargs.recurrent_num_layers 1 \
   --algorithm.sequence_length 8 2>&1 | tee full_trace.log
+继续训练（用 checkpoint 内 train_config.json；GRU 参数已固化其中，无需再传 CLI）
+python -m lerobot.rl.learner --config_path gym-hil/output/checkpoints/last/pretrained_model/train_config.json --resume true 2>&1 | tee full_trace.log
+
 actor:
+从头训练（删除 output_actor）
 python -m lerobot.rl.actor --config_path gym-hil/actor_hil_env.json \
   --policy.policy_kwargs.use_recurrent true \
   --policy.policy_kwargs.recurrent_hidden_size 256 \
   --policy.policy_kwargs.recurrent_num_layers 1 \
   --algorithm.sequence_length 8 2>&1 | tee actor_trace.log
-评估（同普通流程，policy.pretrained_path 指向开 GRU 的 checkpoint；两侧参数仍须一致）
-实验细节与结论见 gym-hil/上下文归档_SAC增加GRU方案.md 第 5 节
+继续训练（删除 output_actor，加载已有权重；actor_hil_env.json 无 GRU 字段，三个 GRU 参数必须 CLI 传，
+漏传时构造出的 actor 无 gru 模块、加载权重报 unexpected keys）
+python -m lerobot.rl.actor --config_path gym-hil/actor_hil_env.json \
+  --policy.pretrained_path gym-hil/output/checkpoints/last/pretrained_model \
+  --policy.policy_kwargs.use_recurrent true \
+  --policy.policy_kwargs.recurrent_hidden_size 256 \
+  --policy.policy_kwargs.recurrent_num_layers 1 \
+  --algorithm.sequence_length 8 2>&1 | tee actor_trace.log
 
+评估（开 GRU 的 checkpoint；三个 policy.policy_kwargs 开关必须与训练时一致——
+eval_simple 加载权重已是 strict=True，漏传或 checkpoint 与配置不匹配会直接报
+missing/unexpected keys 定位问题（不再静默随机）；sequence_length 仅训练采样用，评估无需传）
+最后的检查点（checkpoints/last 符号链接指向最新）
+python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
+  --policy.pretrained_path gym-hil/output/checkpoints/last/pretrained_model \
+  --policy.policy_kwargs.use_recurrent true \
+  --policy.policy_kwargs.recurrent_hidden_size 256 \
+  --policy.policy_kwargs.recurrent_num_layers 1 \
+  --eval.n_episodes 10 --policy.device cuda
+自定义检查点（<6位step> 替换为具体优化步，如 006000）
+python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
+  --policy.pretrained_path gym-hil/output/checkpoints/006000/pretrained_model \
+  --policy.policy_kwargs.use_recurrent true \
+  --policy.policy_kwargs.recurrent_hidden_size 256 \
+  --policy.policy_kwargs.recurrent_num_layers 1 \
+  --eval.n_episodes 10 --policy.device cuda
+实验细节与结论见 gym-hil/上下文归档_SAC增加GRU方案.md 第 5 节
+python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
+  --policy.pretrained_path gym-hil/GRUoutput/checkpoints/014000/pretrained_model \
+  --policy.policy_kwargs.use_recurrent true \
+  --policy.policy_kwargs.recurrent_hidden_size 256 \
+  --policy.policy_kwargs.recurrent_num_layers 1 \
+  --eval.n_episodes 100 --policy.device cuda

@@ -31,21 +31,40 @@ def main(cfg: TrainRLServerPipelineConfig):
 
     # 加载权重...
     weight_path = os.path.join(cfg.policy.pretrained_path, "model.safetensors")
-    if os.path.exists(weight_path):
+    #修改 ============ 权重文件缺失直接报错 ============
+    # 原实现找不到 model.safetensors 时静默继续，会拿随机权重跑完整评估
+    # （路径写错 / last 符号链接断掉时结果完全无效且无提示）。
+    if not os.path.exists(weight_path):
+        raise FileNotFoundError(
+            f"model.safetensors not found in {cfg.policy.pretrained_path}. "
+            "Check --policy.pretrained_path."
+        )
+    #结束 ============================================
 
-        state_dict = load_file(weight_path)
+    state_dict = load_file(weight_path)
 
-        actor_state = {}
-        for k, v in state_dict.items():
-            if k.startswith('actor.'):
-                actor_state[k[6:]] = v
-            elif k.startswith('encoder_actor.'):
-                actor_state[k] = v
-        if actor_state:
-            policy.actor.load_state_dict(actor_state, strict=False)
-
-        else:
-            policy.load_state_dict(state_dict, strict=False)
+    actor_state = {}
+    for k, v in state_dict.items():
+        if k.startswith('actor.'):
+            actor_state[k[6:]] = v
+        elif k.startswith('encoder_actor.'):
+            #修改 ============ encoder_actor 前缀改写 ============
+            # Policy.encoder 与 encoder_actor 是同一对象，policy.actor.state_dict()
+            # 的键是 'encoder.*'；若 checkpoint 以 'encoder_actor.*' 保存（外部来源
+            # 格式），原实现保留原样导致加载时键不匹配被静默忽略（encoder 随机初始化）。
+            #结束 ============================================
+            actor_state["encoder." + k[len("encoder_actor."):]] = v
+    if actor_state:
+        #修改 ============ strict=True 防静默随机 ============
+        # 原为 strict=False：漏传 GRU 开关（policy 无 gru 模块）或 checkpoint 与配置
+        # 不匹配时，权重被静默丢弃、GRU/encoder 保持随机初始化，评估结果无效且无提示。
+        # 改为 strict=True 后与 actor.py 侧加载行为一致（load_state_dict 默认严格），
+        # 键集合不匹配会直接报出 missing/unexpected keys 定位问题。
+        #结束 ============================================
+        policy.actor.load_state_dict(actor_state, strict=True)
+    else:
+        # 兼容性兜底：非本仓库格式（无 'actor.' 前缀）的 checkpoint，宽松加载
+        policy.load_state_dict(state_dict, strict=False)
 
 
     device = get_safe_torch_device(cfg.policy.device, log=True)

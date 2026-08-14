@@ -181,6 +181,9 @@ outputs/
 .mp4
 .safetensors
 output/
+# gym-hil 训练输出（GRUoutput/SACoutput/output_actor 等，含 checkpoint/dataset/wandb，体积大不入库）
+gym-hil/*output*/
+.zcode/
 checkpoint/
 checkpoint_actor/
 offlint_dataset/

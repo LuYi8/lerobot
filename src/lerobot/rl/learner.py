@@ -687,7 +687,19 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
         return cfg
 
     # Case 2: Resuming training
-    checkpoint_dir = os.path.join(out_dir, CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK)
+    #修改 ============ resume 恢复源优先 cfg.checkpoint_path ============
+    # 上游 validate() 已从 --config_path 解析出 checkpoint_path（configs/train.py
+    # _resolve_resume_checkpoint：config_path 指向 <step>/pretrained_model/train_config.json
+    # 时 checkpoint_path=<step> 目录）。原来固定用 checkpoints/last：
+    # 1) 与 --config_path 指定的 step 无关，用户"指定 step 恢复"的意图不生效；
+    # 2) last 符号链接断链时（如 checkpoint 目录被改名）resume 直接报错。
+    # 现在优先用 checkpoint_path（指定哪个 step 就从哪个恢复），None 时退回 last。
+    #结束 ============================================
+    checkpoint_dir = (
+        str(cfg.checkpoint_path)
+        if cfg.checkpoint_path is not None
+        else os.path.join(out_dir, CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK)
+    )
     if not os.path.exists(checkpoint_dir):
         raise RuntimeError(f"No model checkpoint found in {checkpoint_dir} for resume=True")
 
@@ -713,6 +725,9 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
     # 这里把 pretrained_path 指向 checkpoint 的 pretrained_model 目录，make_policy 将走
     # from_pretrained 分支恢复全部策略权重（encoder 也随 policy 一起恢复，与 critic 匹配）。
     checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_MODEL_DIR)
+    # 恢复源目录同样传给 checkpoint_cfg（该字段 init=False 不会从 train_config.json
+    # 加载），供 load_training_state 从同一 checkpoint 恢复优化器/步数。
+    checkpoint_cfg.checkpoint_path = Path(checkpoint_dir)
     #结束 ============================================
     return checkpoint_cfg
 
@@ -741,8 +756,19 @@ def load_training_state(
     if not cfg.resume:
         return None, None
 
-    # Construct path to the last checkpoint directory
-    checkpoint_dir = Path(cfg.output_dir) / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK
+    # Construct path to the checkpoint directory (from cfg.checkpoint_path when
+    # resuming from a --config_path-specified step, else the "last" symlink)
+    #修改 ============ 恢复源与 handle_resume_logic 一致 ============
+    # 原固定 output_dir/checkpoints/last；resume 时 handle_resume_logic 已在
+    # checkpoint_cfg.checkpoint_path 写入实际恢复目录（--config_path 指定 step
+    # 时即该 step），这里必须一致，否则优化器/步数从 last 恢复而权重从指定
+    # step 恢复，两者错位。
+    #结束 ============================================
+    checkpoint_dir = (
+        cfg.checkpoint_path
+        if cfg.checkpoint_path is not None
+        else Path(cfg.output_dir) / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK
+    )
 
     logging.info(f"Loading training state from {checkpoint_dir}")
 
