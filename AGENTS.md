@@ -68,6 +68,14 @@ python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
 - **实验命令**：见 `命令.txt` 末尾"GRU 循环增强实验"小节；从头训练前删 `gym-hil/output` 与 `gym-hil/output_actor`。
 - 改动点均带 `#修改` 标记（configuration_gaussian_actor.py / configuration_sac.py / modeling_gaussian_actor.py / buffer.py / data_mixer.py / sac_algorithm.py / actor.py / eval_simple.py）。
 
+## critic 加 GRU 实验（方案2，critic_use_recurrent，蓝图定稿**未实施**）
+
+> **实施会话必读**：完整蓝图与实施待办见 `gym-hil/上下文归档_SAC增加GRU方案2_critic.md`（§8 为待办总表：写盘阻塞 → 6000/4000 数据管线 → 按 §3 改 3 个文件 → §6 验证 → 真机对比）；实验命令见 `命令.txt`"critic 加 GRU 实验"小节；算法决策/消融/评估总账见 `gym-hil/实验记录_整体.md`。三份先读再动代码。
+
+- **开关**：`--algorithm.critic_use_recurrent true`（默认 false，与 `use_recurrent` 相互独立：全关 / 仅 actor=R-SAC / 仅 critic=消融 / 双关=目标实验）；critic 仅 learner 侧生效（actor 不构造 critic）。
+- **设计**：GRU 输入=纯观测 obs_enc（与 actor GRU 逐字同构、复用 `_NonFlatteningGRU`），**动作在 Q 头前拼入**（head 输入 256+4）；done 掩码镜像 actor（pred 用 done、target 用左移 1 位的 done_next、actor loss 用 done）；td_target 公式零改动；critic 无推理路径（不涉及 actor.py / eval_simple.py）。
+- **实验命令统一带 `--algorithm.use_torch_compile false`**（compile 包 critic，critic GRU 首次进 dynamo 的风险退路；消融对比不含 compile 混杂因素）；数据管线用决策 7：`--policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000`，纯 SAC / R-SAC 基线同配置重跑。
+
 ## 数据与归一化约定
 
 - **图像**：环境输出为 float [0,255]，本地改动将其归一化到 [0,1]（`buffer.py` 中 `to_lerobot_dataset` 处）；数据集以 uint8 存储，读取时转 float/255。改动此逻辑时注意两端一致性。

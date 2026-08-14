@@ -320,7 +320,7 @@ class SACAlgorithm(RLAlgorithm):
             # next 序列比 observations 右移 1 帧（pos idx+1..idx+T），done 必须左移 1 位：
             # done_next[t] = done[t+1]（末位无后续帧、值随意——其 td 恰被 (1-done) 掩码），
             # 否则掩码早 1 帧（静默偏差）：跨 episode 窗口时新 episode 首帧（next 侧）
-            # 被旧 episode 历史污染。td_target 本身仍用 observations 对齐的 done（:313 公式零改动）。
+            # 被旧 episode 历史污染。td_target 本身仍用 observations 对齐的 done（:363 公式零改动）。
             # 观测还原 (B, T, ...) 视图；next features 保持 (B*T, C', H', W') 展平态
             # （与 forward 内部展平后的观测天然对齐）。
             #结束 ============================================

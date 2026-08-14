@@ -1,15 +1,13 @@
 # 上下文归档：SAC 审查与修复（2026-08-13）
 
-> 本文件用于跨对话窗口续接。新窗口先读本文件 + `AGENTS.md`，再从"待办/下一步"继续。
+> 定位：**历史审查记录 + 遗留待办索引**（审查结论/影响分级/已排查清单在本文件；待实施蓝图见《上下文归档_SAC增加GRU方案2_critic.md》，算法总账见《实验记录_整体.md》）。
 > 相关会话任务：审阅五个 SAC 相关代码文件是否有 bug → 已修复 Bug 1/3/4/5；2026-08-13 完成 Bug 影响分级评估（第 3 节）。
+> 遗留待办（Bug 2/6、§6 待办 6 测试契约）与 critic GRU 实施无直接关系，留在本文件 §6；checkpoint 写盘阻塞已桥接至方案2 文档 §8 待办 1。
 
 ## 0. 环境信息（沙箱验证用）
 
-- 仓库：`/home/embody/lerobot`（LeRobot fork，gym-hil HIL-SAC，分支 `原始SAC`）
-- conda 环境：**`lero6`**（python 位于 `/home/embody/miniconda3/envs/lero6/bin/python`，torch 2.11.0+cu126）
-- 沙箱限制：torchcodec 视频解码不可用（缺 ffmpeg 库），需要读数据集视频时**必须**传 `video_backend="pyav"`（pyav 15.1.0 可用）；沙箱无 GPU，验证权重时把 `cfg.policy.device` 改 `"cpu"`
-- 跑验证脚本：`cd /home/embody/lerobot && /home/embody/miniconda3/envs/lero6/bin/python - <<'EOF' ... EOF`（记得 `sys.path.insert(0, "src")`）
-- 上次成功训练的完整输出：`gym-hil/output好/`（checkpoints 001000~005000，`last` 符号链接可用）；当前 `gym-hil/output` 不存在（按约定删除后从头训练）
+- 仓库 / conda 环境 `lero6` / 沙箱限制（pyav、CPU、use_torch_compile=false）/ 验证脚本方式：与《上下文归档_SAC增加GRU方案2_critic.md》§0 相同，不重复维护。
+- 本审查时期（2026-08-13）的完整训练输出：`gym-hil/output好/`（纯 SAC，checkpoints 001000~005000，`last` 符号链接可用；Bug 1 修复验证用它）。
 
 ## 1. 已完成的修改
 
@@ -130,7 +128,7 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 
 1. ~~提交 Bug 1 修复~~（已完成，b3c05a5）。
 2. 续训验证：按 AGENTS.md 命令 resume 一次，对比 `0005000` 与 `last` checkpoint 的 eval 成功率，确认续训起点正确。
-3. **（推荐，效率收益最大）优化 checkpoint 保存耗时**：to_lerobot_dataset 全量写盘阻塞训练（见第 3 节），改异步保存/只存增量/去视频化。
+3. **（推荐，效率收益最大）优化 checkpoint 保存耗时**：to_lerobot_dataset 全量写盘阻塞训练（见第 3 节），改异步保存/只存增量/去视频化。已桥接至《上下文归档_SAC增加GRU方案2_critic.md》§8 待办 1（离线 buffer 扩到 6000 后优先级上调，以方案2 文档为准）。
 4. （可选）修 Bug 2：若计划启用离散夹爪（num_discrete_actions），需配套改 output action shape→[3]、action stats→3 维、`update()` 的 include_complementary_info 全改 True。~~std clamp 改为 log 空间~~（已完成，见第 1 节 Bug 3）。
 5. ~~（可选）把 `use_torch_compile` 配置改为 false~~（已完成：保留 true、改注释）。
 6. **（2026-08-13 新增，可选）修复上游测试失败（Q 统计契约，10 个失败全源于此）**：
@@ -146,7 +144,4 @@ checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_
 
 ## 7. 仓库约定提醒（详见 AGENTS.md）
 
-- 本地改动用 `#修改 ... #结束` / `#===` 注释标记；本次改动已带标记。
-- 分支名/提交信息用中文；实验命令更新到 `gym-hil/命令.txt`。
-- 先 learner 后 actor；从头训练前删 `gym-hil/output` 和 `gym-hil/output_actor`。
-- resume 必须用 checkpoint 内 `train_config.json` + `--resume true`。
+与《上下文归档_SAC增加GRU方案2_critic.md》§9 相同（`#修改` 标记、中文提交、先 learner 后 actor、resume 用 checkpoint 内 train_config.json），不重复维护。

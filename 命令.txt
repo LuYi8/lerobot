@@ -1,6 +1,30 @@
 record:
 python -m lerobot.rl.gym_manipulator --config_path /home/embody/lerobot/gym-hil/record_hil_env.json
 
+扩量采集（一条命令：备份旧数据集→更新集数→采集→stats重算→同步train/actor json）
+bash gym-hil/collect_demo.sh 120
+参数：[采集集数] [record配置json]，默认 60 集 + gym-hil/record_hil_env.json
+注意：gym-hil/dataset 已存在时直接跑上面的 record 命令会 FileExistsError
+     （LeRobotDataset.create 不覆盖不追加，mkdir(exist_ok=False)）；脚本自动把旧数据
+     备份为 dataset_backup_<时间戳>；采集环节需人工键盘遥操作；采集中断可手动 mv 恢复；
+     采集完成后脚本自动重算 stats（写回 meta/stats.json）并同步 dataset_stats 到
+     train_hil_env.json / actor_hil_env.json，同时校验 offline_buffer_capacity >= 数据集帧数
+
+合并数据集（把旧备份追加进新采集的数据集；上游 aggregate_datasets 合并+自动重算 stats）
+bash gym-hil/merge_demo.sh [新数据集] [旧数据集] [输出目录] [train json] [actor json]
+默认：新=gym-hil/dataset，旧=最新 gym-hil/dataset_backup_<时间戳>，输出=gym-hil/dataset_merged
+流程：校验→合并（视频重新打包，几分钟~十几分钟）→校验集数=两源之和→同步 dataset_stats
+注意：合并后总帧数增加，offline_buffer_capacity 需 >= 总帧数（脚本会校验并告警）；
+     源数据集只读不被修改，替换前随时可重来
+
+直接运行（典型流程）：
+# 1) 若上次采集被 Ctrl+C 中断（数据不完整，如只有几集空转），先删除不完整数据集（确认备份完好后再执行）：
+rm -rf gym-hil/dataset
+# 2) 把最新备份合并进新采集的数据集（输出 gym-hil/dataset_merged）：
+bash gym-hil/merge_demo.sh
+# 3) 确认合并结果（脚本打印集数/帧数）后替换：
+rm -rf gym-hil/dataset && mv gym-hil/dataset_merged gym-hil/dataset
+
 
 learner: 
 从头开始(删除output)
@@ -81,3 +105,55 @@ python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
   --policy.policy_kwargs.recurrent_hidden_size 256 \
   --policy.policy_kwargs.recurrent_num_layers 1 \
   --eval.n_episodes 100 --policy.device cuda
+
+
+【critic 加 GRU 实验（方案2，critic_use_recurrent，2026-08-14 蓝图已定稿未实施）】
+开关：--algorithm.critic_use_recurrent true（默认 false，与 use_recurrent 相互独立、自由组合）
+      全关=上游逐位一致 / 仅 actor=现有 R-SAC / 仅 critic=消融 / 双关=目标实验
+设计：GRU 输入=纯观测（obs_enc），动作在 Q 头前拼入（head 输入 256+4）；
+      done 掩码镜像 actor（pred 用 done、target 用左移 1 位的 done_next）；
+      critic 仅 learner 侧生效（actor 不构造 critic）。
+配套：--algorithm.sequence_length 8（同 R-SAC；B = batch_size//T，每批帧数 64 不变）
+      --algorithm.use_torch_compile false（torch.compile 包 critic，critic GRU 首次进
+      dynamo 有 TracingShapeError 风险；4 条实验命令统一关闭，消融对比不含 compile 混杂因素）
+数据管线（决策 7）：--policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000
+      （总帧数 10000 恒等、内存零增长；纯 SAC / R-SAC 基线必须同配置重跑，99% 历史基线仅参考）
+详见 gym-hil/上下文归档_SAC增加GRU方案2_critic.md 第 5 节（命令全集）与 §8 待办。
+
+learner 从头训练（双关目标实验；先删 gym-hil/output）
+python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume false \
+  --policy.policy_kwargs.use_recurrent true \
+  --policy.policy_kwargs.recurrent_hidden_size 256 \
+  --policy.policy_kwargs.recurrent_num_layers 1 \
+  --algorithm.sequence_length 8 --algorithm.critic_use_recurrent true \
+  --algorithm.use_torch_compile false \
+  --policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
+learner 从头训练（消融：仅 critic GRU；use_recurrent 不传 → 默认 false）
+python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume false \
+  --algorithm.sequence_length 8 --algorithm.critic_use_recurrent true \
+  --algorithm.use_torch_compile false \
+  --policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
+learner 从头训练（同配置基线：R-SAC 仅 actor GRU；纯 SAC 去掉 GRU 开关即可）
+python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume false \
+  --policy.policy_kwargs.use_recurrent true \
+  --policy.policy_kwargs.recurrent_hidden_size 256 \
+  --policy.policy_kwargs.recurrent_num_layers 1 \
+  --algorithm.sequence_length 8 \
+  --algorithm.use_torch_compile false \
+  --policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
+续训（用 checkpoint 内 train_config.json；critic_use_recurrent / use_torch_compile 已固化其中，无需再传 CLI）
+python -m lerobot.rl.learner --config_path gym-hil/output/checkpoints/last/pretrained_model/train_config.json --resume true 2>&1 | tee full_trace.log
+actor（critic 仅 learner 侧生效，命令与 R-SAC 相同；若追求两侧配置一致可同传 --algorithm.critic_use_recurrent true，无运行时影响）
+python -m lerobot.rl.actor --config_path gym-hil/actor_hil_env.json \
+  --policy.policy_kwargs.use_recurrent true \
+  --policy.policy_kwargs.recurrent_hidden_size 256 \
+  --policy.policy_kwargs.recurrent_num_layers 1 \
+  --algorithm.sequence_length 8 2>&1 | tee actor_trace.log
+评估（与 R-SAC 完全相同；critic 开关不参与——eval_simple 只加载 actor.* 权重）
+python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
+  --policy.pretrained_path gym-hil/output/checkpoints/006000/pretrained_model \
+  --policy.policy_kwargs.use_recurrent true \
+  --policy.policy_kwargs.recurrent_hidden_size 256 \
+  --policy.policy_kwargs.recurrent_num_layers 1 \
+  --eval.n_episodes 10 --policy.device cuda
+评估结论落盘约定：写入归属 checkpoint 文件夹、按超参数命名的实验记录（见 gym-hil/实验记录_整体.md §4）

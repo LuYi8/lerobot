@@ -187,3 +187,7 @@ gym-hil/*output*/
 checkpoint/
 checkpoint_actor/
 offlint_dataset/
+# gym-hil 采集中间产物（新采集/备份/合并输出不入库；主数据集 gym-hil/dataset 保持跟踪，18MB）
+gym-hil/dataset120*/
+gym-hil/dataset_backup_*/
+gym-hil/dataset_merged*/

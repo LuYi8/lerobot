@@ -88,6 +88,14 @@ class LearnerService(_ServicerBase):
             )
 
             if buffer is None:
+                #修改 ============ 队列空时不忙等 ============
+                # 上游：continue 不更新 last_push_time → 参数队列为空时（预热期
+                # online_step_before_learning 内 learner 不推、两次推送间隔内）
+                # 以 ~1ms 间隔疯狂刷 "[LEARNER] Push parameters" 日志，刷爆
+                # full_trace.log。更新 last_push_time 后改为每 seconds_between_pushes
+                # 重试一次，有货时推送逻辑不变。
+                #结束 ============================================
+                last_push_time = time.time()
                 continue
 
             yield from send_bytes_in_chunks(
