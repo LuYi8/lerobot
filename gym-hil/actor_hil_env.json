@@ -50,7 +50,7 @@
         "temperature_init": 0.01,
         "target_entropy": null,
         "utd_ratio": 2,
-        "policy_update_freq": 1,
+        "policy_update_freq": 2,
         "grad_clip_norm": 10.0,
         "use_torch_compile": true
     },
@@ -482,7 +482,7 @@
         "actor_learner_config": {
             "learner_host": "127.0.0.1",
             "learner_port": 50051,
-            "policy_parameters_push_frequency": 100
+            "policy_parameters_push_frequency": 10
         },
         "concurrency": {
             "actor": "threads",

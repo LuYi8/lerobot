@@ -47,8 +47,10 @@ https://github.com/michel-aractingi/lerobot-hilserl-guide
 import logging
 import os
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
@@ -387,6 +389,12 @@ def add_actor_information_and_train(
     if cfg.dataset is not None:
         dataset_repo_id = cfg.dataset.repo_id
 
+    # 后台数据集 dump 线程：checkpoint 保存不再被 to_lerobot_dataset 全量写盘阻塞
+    # （save_training_checkpoint 内提交 _DatasetDumpTask，本循环结束后排空落盘）
+    dataset_dumper = _CheckpointDatasetDumper() if saving_checkpoint else None
+    if dataset_dumper is not None:
+        dataset_dumper.start()
+
     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
     while True:
         # Exit the training loop if shutdown is requested
@@ -475,7 +483,14 @@ def add_actor_information_and_train(
                 fps=fps,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
+                dataset_dumper=dataset_dumper,
             )
+
+    # 训练循环结束（shutdown / 自然结束）：排空后台数据集 dump 并等待线程退出，
+    # 保证最后一个 checkpoint 的 dataset/dataset_offline 完整落盘
+    # （resume 时 initialize_replay_buffer / initialize_offline_replay_buffer 从中恢复 buffer）。
+    if dataset_dumper is not None:
+        dataset_dumper.wait_and_stop()
 
 
 def start_learner(
@@ -548,6 +563,98 @@ def start_learner(
     logging.info("[LEARNER] gRPC server stopped")
 
 
+#修改 ============ 新增：checkpoint 数据集异步 dump（写盘不再阻塞训练循环） ============
+@dataclass
+class _DatasetDumpTask:
+    """一次 checkpoint 的数据集写盘任务：在线 buffer → output/dataset，离线 → dataset_offline。
+
+    快照（ReplayBuffer.clone_for_dataset）在提交时于主线程完成，与 live buffer
+    零共享存储，worker 线程可安全并发 dump。
+    """
+
+    online_snapshot: ReplayBuffer
+    dataset_dir: str
+    offline_snapshot: ReplayBuffer | None
+    dataset_offline_dir: str
+    fps: int
+    online_repo_id: str
+    offline_repo_id: str | None
+
+    def run(self) -> None:
+        if os.path.exists(self.dataset_dir) and os.path.isdir(self.dataset_dir):
+            shutil.rmtree(self.dataset_dir)
+        self.online_snapshot.to_lerobot_dataset(repo_id=self.online_repo_id, fps=self.fps, root=self.dataset_dir)
+
+        if self.offline_snapshot is not None:
+            if os.path.exists(self.dataset_offline_dir) and os.path.isdir(self.dataset_offline_dir):
+                shutil.rmtree(self.dataset_offline_dir)
+            self.offline_snapshot.to_lerobot_dataset(
+                self.offline_repo_id,
+                fps=self.fps,
+                root=self.dataset_offline_dir,
+            )
+
+
+class _CheckpointDatasetDumper:
+    """单一后台线程串行执行 checkpoint 数据集 dump。
+
+    每次 save_freq 保存时主线程提交一个 _DatasetDumpTask（快照已在提交时冻结），
+    本类保证：
+    - 同一时刻至多一个 dump 在写盘，两个固定目录不会互相覆盖；
+    - dump 耗时超过保存间隔时，只保留最新待写任务（合并丢弃中间态），
+      内存上界 = 1 份在写快照 + 1 份待写快照；
+    - 训练循环结束后 wait_and_stop() 排空待写任务并等待线程退出，保证最后一个
+      checkpoint 的 dataset/dataset_offline 完整落盘（resume 依赖它们恢复 buffer）。
+    """
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._pending: _DatasetDumpTask | None = None
+        self._stop = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, name="checkpoint-dataset-dumper", daemon=False
+        )
+        self._thread.start()
+
+    def submit(self, task: _DatasetDumpTask) -> None:
+        """提交一次 dump 任务；已有待写任务时被新任务合并替换（丢弃中间态快照）。"""
+        with self._condition:
+            if self._stop:
+                logging.warning("[LEARNER] Dataset dumper is stopping, skipping checkpoint dataset save")
+                return
+            self._pending = task
+            self._condition.notify()
+
+    def wait_and_stop(self) -> None:
+        """排空待写任务并等待后台线程结束（进程退出前调用，保证最后一份数据集落盘）。"""
+        with self._condition:
+            self._stop = True
+            self._condition.notify()
+        if self._thread is not None:
+            self._thread.join()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._stop:
+                    self._condition.wait()
+                task = self._pending
+                self._pending = None
+                if task is None:
+                    break
+            try:
+                task.run()
+            except Exception:
+                # dump 失败不拖垮训练（下一轮保存仍会重试）；数据集缺失只影响 resume 时的 buffer 恢复
+                logging.exception("[LEARNER] Failed to dump checkpoint dataset, training continues")
+
+
+#结束 ================================================================
+
+
 def save_training_checkpoint(
     cfg: TrainRLServerPipelineConfig,
     optimization_step: int,
@@ -562,6 +669,7 @@ def save_training_checkpoint(
     fps: int = 30,
     preprocessor=None,
     postprocessor=None,
+    dataset_dumper: _CheckpointDatasetDumper | None = None,
 ) -> None:
     """
     Save training checkpoint and associated data.
@@ -574,6 +682,9 @@ def save_training_checkpoint(
     5. Saves the replay buffer as a dataset for later use
     6. If an offline replay buffer exists, saves it as a separate dataset
 
+    Steps 5/6 (the expensive buffer→dataset dumps) are handed to ``dataset_dumper``
+    for asynchronous disk writing when provided; otherwise they run synchronously.
+
     Args:
         cfg: Training configuration
         optimization_step: Current optimization step
@@ -582,11 +693,13 @@ def save_training_checkpoint(
         policy: Policy model to save
         optimizers: Dictionary of optimizers
         replay_buffer: Replay buffer to save as dataset
+        algorithm: Optional RL algorithm
         offline_replay_buffer: Optional offline replay buffer to save
         dataset_repo_id: Repository ID for dataset
         fps: Frames per second for dataset
         preprocessor: Optional preprocessor pipeline to save
         postprocessor: Optional postprocessor pipeline to save
+        dataset_dumper: Optional background dumper for async dataset writes
     """
     logging.info(f"Checkpoint policy after step {optimization_step}")
     _num_digits = max(6, len(str(online_steps)))
@@ -623,28 +736,44 @@ def save_training_checkpoint(
     # Update the "last" symlink
     update_last_checkpoint(checkpoint_dir)
 
-    # TODO : temporary save replay buffer here, remove later when on the robot
-    # We want to control this with the keyboard inputs
-    dataset_dir = os.path.join(cfg.output_dir, "dataset")
-    if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
-        shutil.rmtree(dataset_dir)
-
-    # Save dataset
+    # 数据集 dump（在线 buffer → output/dataset，离线 buffer → output/dataset_offline）
+    # 原实现同步全量写盘（to_lerobot_dataset 逐帧编码视频+写盘），保存一次阻塞训练循环
+    # 数十秒；现在提交给后台线程异步写盘。快照在提交时于主线程完成（clone_for_dataset：
+    # 紧凑拷贝，图像转 uint8，约 100KB/帧、~1s 内），冻结保存时点的 buffer 内容。
     # NOTE: Handle the case where the dataset repo id is not specified in the config
     # eg. RL training without demonstrations data
     repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
-    replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
-
-    if offline_replay_buffer is not None:
-        dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
-        if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
-            shutil.rmtree(dataset_offline_dir)
-
-        offline_replay_buffer.to_lerobot_dataset(
-            cfg.dataset.repo_id,
-            fps=fps,
-            root=dataset_offline_dir,
+    if dataset_dumper is not None:
+        dataset_dumper.submit(
+            _DatasetDumpTask(
+                online_snapshot=replay_buffer.clone_for_dataset(),
+                dataset_dir=os.path.join(cfg.output_dir, "dataset"),
+                offline_snapshot=(
+                    offline_replay_buffer.clone_for_dataset() if offline_replay_buffer is not None else None
+                ),
+                dataset_offline_dir=os.path.join(cfg.output_dir, "dataset_offline"),
+                fps=fps,
+                online_repo_id=repo_id_buffer_save,
+                offline_repo_id=cfg.dataset.repo_id if offline_replay_buffer is not None else None,
+            )
         )
+    else:
+        # 无 dumper（外部调用/测试）时保持原同步行为
+        dataset_dir = os.path.join(cfg.output_dir, "dataset")
+        if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
+            shutil.rmtree(dataset_dir)
+        replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
+
+        if offline_replay_buffer is not None:
+            dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
+            if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
+                shutil.rmtree(dataset_offline_dir)
+
+            offline_replay_buffer.to_lerobot_dataset(
+                cfg.dataset.repo_id,
+                fps=fps,
+                root=dataset_offline_dir,
+            )
 
     logging.info("Resume training")
 

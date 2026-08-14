@@ -70,11 +70,11 @@ python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
 
 ## critic 加 GRU 实验（方案2，critic_use_recurrent，蓝图定稿**未实施**）
 
-> **实施会话必读**：完整蓝图与实施待办见 `gym-hil/上下文归档_SAC增加GRU方案2_critic.md`（§8 为待办总表：写盘阻塞 → 6000/4000 数据管线 → 按 §3 改 3 个文件 → §6 验证 → 真机对比）；实验命令见 `命令.txt`"critic 加 GRU 实验"小节；算法决策/消融/评估总账见 `gym-hil/实验记录_整体.md`。三份先读再动代码。
+> **实施会话必读**：完整蓝图与实施待办见 `gym-hil/上下文归档_SAC增加GRU方案2_critic.md`（§8 为待办总表：写盘阻塞 → 8500/4000 数据管线 → 按 §3 改 3 个文件 → §6 验证 → 真机对比）；实验命令见 `命令.txt`"critic 加 GRU 实验"小节；算法决策/消融/评估总账见 `gym-hil/实验记录_整体.md`。三份先读再动代码。
 
 - **开关**：`--algorithm.critic_use_recurrent true`（默认 false，与 `use_recurrent` 相互独立：全关 / 仅 actor=R-SAC / 仅 critic=消融 / 双关=目标实验）；critic 仅 learner 侧生效（actor 不构造 critic）。
 - **设计**：GRU 输入=纯观测 obs_enc（与 actor GRU 逐字同构、复用 `_NonFlatteningGRU`），**动作在 Q 头前拼入**（head 输入 256+4）；done 掩码镜像 actor（pred 用 done、target 用左移 1 位的 done_next、actor loss 用 done）；td_target 公式零改动；critic 无推理路径（不涉及 actor.py / eval_simple.py）。
-- **实验命令统一带 `--algorithm.use_torch_compile false`**（compile 包 critic，critic GRU 首次进 dynamo 的风险退路；消融对比不含 compile 混杂因素）；数据管线用决策 7：`--policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000`，纯 SAC / R-SAC 基线同配置重跑。
+- **实验命令统一带 `--algorithm.use_torch_compile false`**（compile 包 critic，critic GRU 首次进 dynamo 的风险退路；消融对比不含 compile 混杂因素）；数据管线用决策 7（修订）：`--policy.offline_buffer_capacity 8500 --policy.online_buffer_capacity 4000`（离线 8500 为装下 8252 帧演示的硬约束，容量不足 `from_lerobot_dataset` 直接报错），纯 SAC / R-SAC 基线同配置重跑。
 
 ## 数据与归一化约定
 
@@ -92,6 +92,8 @@ python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
   - `src/lerobot/rl/actor.py:322` — `num_discrete_actions` 时只对连续部分做 unnormalize，离散部分拼接回去。
   - `src/lerobot/rl/buffer.py:593,607` — `to_lerobot_dataset` 时图像归一化到 [0,1]。
   - `src/lerobot/rl/algorithms/sac/sac_algorithm.py:204` — critic 更新循环（utd 内多次更新）+ Q 值统计日志（`Q1_mean`/`targetQ_mean` 等，计入 wandb）。
+  - `src/lerobot/rl/learner.py` — checkpoint 数据集异步 dump（`_CheckpointDatasetDumper` 后台线程 + `_DatasetDumpTask`；`save_training_checkpoint` 提交 `clone_for_dataset()` 紧凑快照，写盘不再阻塞训练循环；无 dumper 时同步兜底）。
+  - `src/lerobot/rl/buffer.py` — `clone_for_dataset()` 紧凑冻结快照（异步 dump 用：图像转 uint8 零共享，范围判定只扫 size 内槽位）。
   - `src/lerobot/rl/eval_simple.py` — 独立评估脚本（不属于上游）。
 - 修改 `rl/` 或 `policies/gaussian_actor/` 时，**需同时考虑 actor/learner 两侧一致性**（两侧各自 `make_policy` 实例化策略，靠 gRPC 传参数）。
 - 新实验脚本 / 配置放在 `gym-hil/`；输出目录 `gym-hil/output*`（已 gitignore）。

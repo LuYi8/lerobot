@@ -27,7 +27,7 @@
         "temperature_lr": 0.0003,
         "discount": 0.97,
         "use_backup_entropy": true,
-        "critic_target_update_weight": 0.05,
+        "critic_target_update_weight": 0.005,
         "num_critics": 2,
         "num_subsample_critics": null,
         "critic_network_kwargs": {
@@ -481,7 +481,7 @@
         "actor_learner_config": {
             "learner_host": "127.0.0.1",
             "learner_port": 50051,
-            "policy_parameters_push_frequency": 200
+            "policy_parameters_push_frequency": 10
         },
         "concurrency": {
             "actor": "threads",

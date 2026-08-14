@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import functools
 import threading
 from collections.abc import Callable, Sequence
@@ -750,6 +751,56 @@ class ReplayBuffer:
         lerobot_dataset.finalize()
 
         return lerobot_dataset
+
+    #修改 ============ 新增：紧凑冻结快照（异步数据集 dump 用） ============
+    def clone_for_dataset(self) -> "ReplayBuffer":
+        """Create a compact frozen snapshot for asynchronous dataset dumping.
+
+        The snapshot shares no storage with the live buffer, so a background thread
+        can dump it to a LeRobotDataset while the training loop keeps writing to and
+        sampling from the buffer. Images are compacted to uint8 (the dataset video
+        pipeline is 8-bit, so this is lossless w.r.t. the final output); other
+        features are cloned with their original dtype. The dump only reads
+        states/actions/rewards/dones/truncateds/complementary_info, so those are the
+        fields that get frozen.
+        """
+        if not self.initialized or self.size == 0:
+            raise ValueError("The replay buffer is empty. Cannot create a dataset snapshot.")
+
+        # 写方只有 learner 主循环（process_transitions→add），快照在主线程提交时
+        # 天然一致；加锁是双保险，防止未来出现第二个写方。
+        snapshot = copy.copy(self)
+        with self._lock:
+            snapshot.size = self.size
+            snapshot.position = self.position
+            snapshot.states = {
+                key: self._compact_feature_for_dataset(val) for key, val in self.states.items()
+            }
+            snapshot.actions = self.actions.clone()
+            snapshot.rewards = self.rewards.clone()
+            snapshot.dones = self.dones.clone()
+            snapshot.truncateds = self.truncateds.clone()
+            if self.has_complementary_info:
+                snapshot.complementary_info = {
+                    key: (val.clone() if isinstance(val, torch.Tensor) else val)
+                    for key, val in self.complementary_info.items()
+                }
+        return snapshot
+
+    def _compact_feature_for_dataset(self, val: torch.Tensor) -> torch.Tensor:
+        # 图像以 (capacity, C, H, W) 存储；仅在数据语义为 [0,255]（float>1 或 uint8）时
+        # 压缩为 uint8。[0,1] float 数据保持原样（与 to_lerobot_dataset 的归一化分支
+        # 判定一致），避免误量化。范围判定只扫描 size 内已写入的槽位
+        # （torch.empty 未写槽位是随机垃圾值，扫全张量会导致误判），且隔步抽样
+        # 避免全量扫描的开销。
+        if val.ndim == 4:
+            if val.dtype == torch.uint8:
+                return val.clone()
+            if val.dtype.is_floating_point and val[: self.size].view(-1)[::257].max() > 1.0:
+                return val.byte()
+        return val.clone()
+
+    #结束 ================================================================
 
     @staticmethod
     def _lerobotdataset_to_transitions(

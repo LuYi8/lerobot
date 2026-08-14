@@ -2,8 +2,8 @@
 
 > 本文件用于跨对话窗口续接。实施前先读本文件 + `AGENTS.md` + 第一篇《上下文归档_SAC增加GRU方案.md》（R-SAC 实施蓝图），从"下一步待办"（第 8 节）继续。
 > 相关会话任务：以最小改动量、最大兼容性，在当前 R-SAC（仅 actor 循环，2026-08-13 已实施并真机验证：14000 步成功率 99% vs 纯 SAC 45%）的 critic 中增加 GRU，进一步提高抓方块成功率。
-> 方案已与用户逐条确认（第 1 节决策 1"独立开关"、决策 2"GRU 纯观测输入 + 动作在头"、决策 7"离线 6000 / 在线 4000"均为 2026-08-14 用户确认），**尚未实施**；本文档为完整实施蓝图。
-> 数据管线事实已实测核实（2026-08-14，见 §0 与 §4.5）：online_ratio=0.5、在线 buffer 8000 / 离线 buffer 2000、离线 buffer 内容 = 演示数据集 + 仅干预 transition（100% 人类动作）。
+> 方案已与用户逐条确认（第 1 节决策 1"独立开关"、决策 2"GRU 纯观测输入 + 动作在头"、决策 7"离线 8500 / 在线 4000"均为 2026-08-14 用户确认；决策 7 当日修订：原"离线 6000"装不下扩采后的演示数据集 8252 帧，`from_lerobot_dataset` 容量不足直接 ValueError，离线容量提到 8500），**尚未实施**；本文档为完整实施蓝图。
+> 数据管线事实（见 §0 与 §4.5）：历史 99% 运行（GRUoutput，2026-08-13）为 在线 8000 / 离线 2000 + 582 帧演示；当前 json（560bd5d 起）为 在线 1500 / 离线 8500 + 8252 帧演示（150 集）；离线 buffer 内容 = 演示数据集 + 仅干预 transition（100% 人类动作）。
 
 ## 0. 环境信息（沙箱验证用）
 
@@ -12,11 +12,10 @@
 - 沙箱限制：torchcodec 视频解码不可用（缺 ffmpeg 库），读数据集视频必须传 `video_backend="pyav"`；沙箱无 GPU，验证权重时把 `cfg.policy.device` 改 `"cpu"`，且 `use_torch_compile=false`（CPU 沙箱下 dynamo 无法对 frozen ResNet10 做 fake-tensor 推断）
 - 跑验证脚本：`cd /home/embody/lerobot && /home/embody/miniconda3/envs/lero6/bin/python - <<'EOF' ... EOF`（记得 `sys.path.insert(0, "src")`）
 - 上次成功训练完整输出：`gym-hil/output好/`（纯 SAC，checkpoints 001000~005000）、`gym-hil/GRUoutput/`（R-SAC 真机实验，014000 步 99%），均用于零回归对比与基线
-- **实测数据管线（train_hil_env.json = GRUoutput 的 train_config.json，逐字段一致）**：
-  - `online_ratio=0.5` → 每批 50% 来自在线 buffer、50% 来自离线 buffer（`OnlineOfflineMixer.sample`，n_online = int(batch×0.5)）
-  - `online_buffer_capacity=8000`（在线 buffer：**全部**在线数据——自动 + 干预，最近窗口；learner.py:1013 `replay_buffer.add(**transition)` 无条件）
-  - `offline_buffer_capacity=2000`（离线 buffer：演示数据集 seed（make_dataset，人类遥操作 ~582 帧，learner.py:894-900）+ **仅干预** transition（learner.py:1014-1016 `if IS_INTERVENTION: offline_replay_buffer.add(...)`）；内容 **100% 人类动作**）
-  - **实测填充时序（用户 2026-08-14 提供）**：离线 buffer 在总交互步 ~2800 满（容量 2000 + 582 演示 → 前 2800 步干预率 ≈ 50%；**演示数据在 ~4000 总步前被环形淘汰**）；在线 buffer 在 ~8100 总步满（8000 容量 + 预热 100，1:1 吻合）。量化分析见 §4.5
+- **数据管线演变**：
+  - 历史 99% 运行（GRUoutput，2026-08-13）：当时 json 为 在线 8000 / 离线 2000、演示 ~582 帧；**实测填充时序（用户 2026-08-14 提供）**：离线 buffer 在总交互步 ~2800 满（容量 2000 + 582 演示 → 前 2800 步干预率 ≈ 50%；**演示数据在 ~4000 总步前被环形淘汰**）；在线 buffer 在 ~8100 总步满（8000 容量 + 预热 100，1:1 吻合）。
+  - 当前 json（560bd5d 起，2026-08-14）：`online_buffer_capacity=1500`、`offline_buffer_capacity=8500`，演示数据集扩至 **150 集 / 8252 帧**（离线容量 8500 恰好容纳演示全集 + 248 帧干预余位）。
+  - 通用（两侧一致）：`online_ratio=0.5` → 每批 50% 来自在线 buffer、50% 来自离线 buffer（`OnlineOfflineMixer.sample`，n_online = int(batch×0.5)）；在线 buffer = **全部**在线数据——自动 + 干预，最近窗口（learner.py:1013 `replay_buffer.add(**transition)` 无条件）；离线 buffer = 演示数据集 seed（make_dataset，人类遥操作，learner.py:894-900）+ **仅干预** transition（learner.py:1016-1018 `if IS_INTERVENTION: offline_replay_buffer.add(...)`）；内容 **100% 人类动作**）。量化分析见 §4.5
   - 环境观测：`observation.state` 18 维 = qpos(7)+qvel(7)+gripper(1)+tcp_pos(3)（gym-hil/gym_hil/mujoco_gym_env.py:260-268），**不含方块位置**；方块位姿只出现在 front/wrist 图像（128×128 @10fps）→ 环境真部分可观测，历史信息有价值
 - 相关归档：第一篇《上下文归档_SAC增加GRU方案.md》（R-SAC 蓝图，已实施；`_NonFlatteningGRU` 修复记录见其 §10）、`gym-hil/上下文归档_SAC审查与修复.md`（Bug 1/3/4/5 已修；2/6 待修）
 - 真机实验基线（2026-08-14，commit 6c9b7e9）：R-SAC（actor GRU）14000 步 99% vs 纯 SAC 45%，同步数稳定领先 25~54 个百分点
@@ -35,7 +34,7 @@
 | 4 | **done 掩码时序镜像 actor**："处理完第 t 帧后 `h *= (1 - done[:, t])`"；pred Q 传 observations 对齐的 done、target Q 传左移 1 位的 `done_next`、actor loss 的 Q 传 observations 对齐的 done | 与 actor 完全一致（含第一篇 §3.6 的"done 左移"教训）；td_target 公式零改动 |
 | 5 | **配置校验（learner 侧 ValueError）**：`critic_use_recurrent=true` 与 `use_recurrent=true` 均要求 `sequence_length>1` | critic GRU 依赖序列采样；`use_recurrent=true + seq=1` 目前是静默垃圾形状（潜在雷，顺带修复） |
 | 6 | **actor 前馈 else 分支加 ~6 行序列展平** | 决策 1 的前置：`use_recurrent=false + seq>1` 时 loss 函数传 `(B, T, ...)` 视图，需展平 `(B*T, ...)` 再进 encoder（否则 5D 图像喂 ResNet10 崩溃）；seq=1 时检测不命中，**逐位不变** |
-| 7 | **消融实验数据管线 = 离线 6000 / 在线 4000**（总帧数 10000 与现状恒等 → 内存零增长）；**同一新配置下重跑纯 SAC / R-SAC 基线**做公平消融；历史 99% 基线（2000/8000）仅作参考 | 2026-08-14 用户确认；离线池更大（演示存活至 ~12600 总步、重放冗余 450→150、多样性 25→75 episode）+ 在线池更新鲜（6.7 分钟）；量化分析见 §4.5；代价：checkpoint 保存 dataset_offline 写盘量 ×3（见 §8 待办 1） |
+| 7 | **消融实验数据管线 = 离线 8500 / 在线 4000**（2026-08-14 修订：原 6000 装不下扩采后的 8252 帧演示，`from_lerobot_dataset` 容量不足直接 ValueError → 离线提到 8500；总帧数 12500，较当前 10000 内存 +25%）；**同一新配置下重跑纯 SAC / R-SAC 基线**做公平消融；历史 99% 基线（2000/8000）仅作参考 | 2026-08-14 用户确认；离线池 = 演示全集 103 集 + 仅 248 帧干预余位（干预超限后从最老演示帧开始环形淘汰）；在线池 4000 步 = 50 集 = 6.7 分钟（比历史基线 8000 更新鲜、比当前 1500 更陈旧，给离线池腾容量）；量化分析见 §4.5；代价：checkpoint 保存 dataset_offline 写盘量 ×4.25（vs 历史 2000；见 §8 待办 1） |
 
 ## 2. 设计要点
 
@@ -209,11 +208,13 @@ pred `Q_t = Q(s_t, a_t | h_t)`，h_t 为观测历史（窗口起点前零初始�
 - **经验证据**：actor GRU 输入即纯 obs_enc（modeling_gaussian_actor.py:526），14000 步 99%——策略需要同样的"方块在哪/往哪动"上下文并成功学到；critic 所需状态信念与 actor 同源；
 - 残留风险（诚实声明）：方块被遮挡且恰在被推的窗口内，A1 有增益；若 A2 实测不足，升级路径 **A3**：行为动作进循环 + 查询动作在头（`Q'(s_{t+1}, a^π | h'^β)`，最贴近 R2D2 语义），但 target 末位帧（帧 idx+T）的行为动作不在 batch 内，需 buffer 补 `next_actions` 或填充约定——改动最大，作为备选消融而非本方案默认。
 
-### 4.5 缓冲区大小分析（2026-08-14 实测核实；对比实验不改）
-- 事实：`online_ratio=0.5`、在线 8000 / 离线 2000（与曾以为的"离线 8000 / 在线 2000"相反）；离线 buffer = 演示（582 帧）+ 仅干预。
-- **本实验立场（决策 7，2026-08-14 更新）**：消融实验采用 **离线 6000 / 在线 4000**（总帧数恒等 10000，内存零增长）；**同一新配置下重跑纯 SAC / R-SAC 基线**做公平消融（99% 历史基线仅参考，不可直接比）。
-- **若单独调的方向（用户直觉"离线大、在线小"有理论支撑）**：离线 buffer 容量 = 人类修正池多样性（2000 步 ≈ 25 episode，干预频繁时环形覆盖**先淘汰演示**，只剩最近修正；8000 ≈ 100 episode 保留更多早期课程 + 演示留存更久）；在线 buffer 容量 = 当前策略窗口新鲜度（8000 步 ≈ 13.3 分钟，训练早期策略分钟级演化，在线半区陈旧数据多；2000 ≈ 3.3 分钟更鲜）。建议值：离线 8000 / 在线 2000。
-- 注意：(i) 若干预总量 < 2000 步，离线容量不触顶（可从 wandb 干预率确认 R-SAC 运行的实际干预量）；(ii) 0.5/0.5 混合比本身是另一个旋钮。
+### 4.5 缓冲区大小分析（2026-08-14 实测核实；2026-08-14 修订对齐当前 json 与 8252 帧演示集）
+- 事实：`online_ratio=0.5`；当前 json（560bd5d 起）= **在线 1500 / 离线 8500**，演示 150 集 8252 帧；历史 99% 运行（GRUoutput）= 在线 8000 / 离线 2000、演示 582 帧。离线 buffer = 演示全集 + 仅干预。
+- **硬约束（2026-08-14 修订触发点）**：`from_lerobot_dataset`（buffer.py）在 `capacity < len(dataset)` 时直接 `raise ValueError`——离线容量必须 ≥ 8252；原决策 7 的 6000 按蓝图命令启动即崩。当前 json 的 8500 已满足。
+- **本实验立场（决策 7，2026-08-14 修订）**：消融实验采用 **离线 8500 / 在线 4000**（总帧数 12500，较当前 10000 内存 +25%；存储于 CPU，实际占用可忽略）；**同一新配置下重跑纯 SAC / R-SAC 基线**做公平消融（99% 历史基线仅参考，不可直接比）。
+- **量化**：离线 8500 = 演示 8252 帧（103 集）+ **248 帧干预余位**——加载即 97% 满，干预每写入 1 帧就环形淘汰 1 帧最老数据（先淘汰干预自身，第 249 帧干预起开始淘汰最老演示帧）；对比历史 2000+582（演示占 74.5%、~4000 总步才被淘汰）：新配置演示**数量**多 14 倍、被淘汰得更早但相对占比更小。在线 4000 = 50 集 = 6.7 分钟窗口（比历史基线 8000 的 13.3 分钟更新鲜、比当前 1500 的 2.5 分钟陈旧——在线池缩小是为给离线池腾容量，与旧表述"在线更新鲜"口径不同，以本节为准）。
+- **若单独调的方向（用户直觉"离线大、在线小"有理论支撑）**：离线 buffer 容量 = 人类修正池多样性（当前 8500 ≈ 106 集含 103 集演示；容量再大 → 干预余位更多、演示淘汰更慢）；在线 buffer 容量 = 当前策略窗口新鲜度（当前 1500 ≈ 2.5 分钟最鲜；历史 8000 ≈ 13.3 分钟最陈旧）。**当前 json 的 1500/8500 已实现"离线大、在线小"方向**，本实验仅把在线提到 4000。
+- 注意：(i) 离线余位仅 248 帧——只要干预总量 > 248 步（按历史干预率几乎必然），演示从第 249 帧干预起即开始被淘汰（可从 wandb 干预率确认实际干预量）；(ii) 0.5/0.5 混合比本身是另一个旋钮。
 
 ### 4.6 计算量与梯度
 - 数据吞吐 `B×T=64` 恒定（机制现成）；GRU 参数 ≈ 46 万/网络（§2），相对整体策略占比小。
@@ -231,20 +232,20 @@ pred `Q_t = Q(s_t, a_t | h_t)`，h_t 为观测历史（窗口起点前零初始�
 | **双关（目标实验）** | true | true | 完整方案 |
 
 ```bash
-# learner：双关目标实验（从头训练，先删 gym-hil/output；数据管线 = 决策 7：离线 6000 / 在线 4000）
+# learner：双关目标实验（从头训练，先删 gym-hil/output；数据管线 = 决策 7 修订：离线 8500 / 在线 4000）
 python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume false \
   --policy.policy_kwargs.use_recurrent true \
   --policy.policy_kwargs.recurrent_hidden_size 256 \
   --policy.policy_kwargs.recurrent_num_layers 1 \
   --algorithm.sequence_length 8 --algorithm.critic_use_recurrent true \
   --algorithm.use_torch_compile false \
-  --policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
+  --policy.offline_buffer_capacity 8500 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
 
-# learner：消融（仅 critic GRU；use_recurrent 不传 → 默认 false；同一 6000/4000 配置）
+# learner：消融（仅 critic GRU；use_recurrent 不传 → 默认 false；同一 8500/4000 配置）
 python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume false \
   --algorithm.sequence_length 8 --algorithm.critic_use_recurrent true \
   --algorithm.use_torch_compile false \
-  --policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
+  --policy.offline_buffer_capacity 8500 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
 
 # learner：新配置基线（R-SAC 仅 actor GRU——必须与消融同配置重跑；纯 SAC 同理去掉 GRU 开关即可）
 python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume false \
@@ -253,7 +254,7 @@ python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume f
   --policy.policy_kwargs.recurrent_num_layers 1 \
   --algorithm.sequence_length 8 \
   --algorithm.use_torch_compile false \
-  --policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
+  --policy.offline_buffer_capacity 8500 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
 
 # 续训（用 checkpoint 内 train_config.json，critic_use_recurrent 已固化其中，无需再传 CLI）
 python -m lerobot.rl.learner --config_path gym-hil/output/checkpoints/last/pretrained_model/train_config.json --resume true 2>&1 | tee full_trace.log
@@ -278,7 +279,7 @@ python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
 - `sequence_length` 档位沿用第一篇 §5 表（8 推荐 / 16 / 4）；`utd_ratio=2`、`batch_size=64` 不变 → 每优化步 128 帧，与现状相同。
 - **统一带 `--algorithm.use_torch_compile false`**：torch.compile 在 `_init_critics`（:103-105）包 critic，critic GRU 首次进 dynamo（CUDA 首次前向 specialize）有 TracingShapeError 风险（§7）；4 条实验命令（双关/消融/两条基线）统一关闭 → 消融对比不含 compile 混杂因素。续训命令不带（`use_torch_compile` 已固化在 checkpoint 内 `train_config.json`）。actor 侧不编译 critic、无需带。
 - 从头训练前删 `gym-hil/output` 与 `gym-hil/output_actor`；先 learner 后 actor。
-- **数据管线 = 决策 7：离线 6000 / 在线 4000**（总帧数 10000 恒等、内存零增长）；纯 SAC / R-SAC 基线用同一配置重跑（§4.5）。
+- **数据管线 = 决策 7（修订）：离线 8500 / 在线 4000**（总帧数 12500、内存较当前 +25%；离线 8500 是装下 8252 帧演示的硬约束，见 §4.5）；纯 SAC / R-SAC 基线用同一配置重跑（§4.5）。
 - 预期收益：critic 的 Q 估值用上观测历史（部分可观测：方块位姿不在 state 中、靠图像推断；历史提供运动上下文）→ 估值更准 → 策略梯度信号更稳；对照基线 R-SAC 14000 步 99% vs 纯 SAC 45%。
 
 ## 6. 验证清单（实施后执行）
@@ -301,12 +302,12 @@ python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
 - **`_NonFlatteningGRU`**：进程内一次性 cuDNN UserWarning（权重非连续内存），无碍（同 e4ac49b 遗留）。
 - 离散 critic（`num_discrete_actions` 非空时）保持前馈，不在本次范围；若以后启用需单独评估。
 - actor/learner 两侧 `policy.policy_kwargs` 与 `algorithm.sequence_length` 必须一致（AGENTS.md 既有约定）；`critic_use_recurrent` 仅 learner 生效。
-- **buffer 参数（决策 7）**：消融实验固定 离线 6000 / 在线 4000；0.5/0.5 混合比与其余数据管线参数保持基线值；纯 SAC / R-SAC 基线须同配置重跑（99% 历史基线仅参考）。
+- **buffer 参数（决策 7 修订）**：消融实验固定 离线 8500 / 在线 4000；0.5/0.5 混合比与其余数据管线参数保持基线值；纯 SAC / R-SAC 基线须同配置重跑（99% 历史基线仅参考）。
 
 ## 8. 下一步待办（按优先级）
 
-1. **[优先] 修复 checkpoint 全量写盘阻塞**（to_lerobot_dataset 同步写盘，learner.py:636/643）：每次 save_freq 保存全量 dump 在线/离线 buffer 为数据集，阻塞训练循环（《上下文归档_SAC审查与修复.md》§6 待办 3，未修复）。离线 buffer 扩到 6000 后 dataset_offline 写盘量 ×3，优先级上升。方向：异步保存 / 只存增量 / 去视频化。
-2. **[优先] 数据管线改为 离线 6000 / 在线 4000**（决策 7，消融实验配置）：`--policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000`（总帧数 10000 恒等、内存零增长）；**必须用同一新配置重跑纯 SAC / R-SAC 基线**做公平消融（99% 历史基线仅参考，不可直接比）。
+1. **~~[优先] 修复 checkpoint 全量写盘阻塞~~ ✅ 已实施（2026-08-14）**：to_lerobot_dataset 同步写盘（learner.py:636/643）改为**异步后台 dump**——`save_training_checkpoint` 提交 `_DatasetDumpTask`（快照 `ReplayBuffer.clone_for_dataset()` 在主线程完成：紧凑拷贝、图像转 uint8 约 100KB/帧、~1s 内），单一 `_CheckpointDatasetDumper` 线程串行写盘；dump 耗时超保存间隔时只保留最新待写任务（合并丢弃中间态，内存上界 2 份快照）；训练循环结束后 `wait_and_stop()` 排空，保证最后一份 dataset 完整落盘（resume 恢复源）。实现选**异步保存**方向（非只存增量/去视频化）；同步兜底分支保留（无 dumper 时行为与原来逐位一致）。验证：`gym-hil/tests/verify_async_dataset_dump.py` 16 项全 PASS（快照==同步 dump 逐帧一致含并发写环形覆盖、负向对照证明零共享、uint8 紧凑化分支、dumper 合并去旧语义、真实任务端到端落盘）；buffer 序列采样零回归 PASS。改动点：`buffer.py:clone_for_dataset`、`learner.py:_DatasetDumpTask/_CheckpointDatasetDumper`（均带 `#修改` 标记）。遗留说明：快照提交在主线程约阻塞 0.5~1s/次（10000 帧），相对原全量写盘数十秒级阻塞可忽略。
+2. **[优先] 数据管线改为 离线 8500 / 在线 4000**（决策 7 修订，消融实验配置）：`--policy.offline_buffer_capacity 8500 --policy.online_buffer_capacity 4000`（离线 8500 为装下 8252 帧演示的硬约束，`from_lerobot_dataset` 容量不足直接 ValueError；总帧数 12500、内存较当前 +25%；当前 json 已为 8500/1500，仅需覆盖 online=4000）；**必须用同一新配置重跑纯 SAC / R-SAC 基线**做公平消融（99% 历史基线仅参考，不可直接比）。
 3. 按第 3 节实施 critic GRU 代码改动（全部带 `#修改 ... #结束` / `#===` 标记）。**实施注意事项（2026-08-14 蓝图全文审核结论，与代码逐条核对无实质 bug，以下为防御/确认项）**：
    - ① `actions.view(B, T, -1)` 用 **`reshape`** 代替：`actions[:, :DISCRETE_DIMENSION_INDEX]` 截断（:370）后是非连续切片（stride (4,1)），view 对非连续张量直接 RuntimeError；当前 `num_discrete_actions=null` 不触发截断，但属防御性改法（离散 critic 未来启用即踩雷）。**已固化：§3.3 片段/§2 伪代码现一律用 reshape。**
    - ② GRU 实验命令统一加 **`--algorithm.use_torch_compile false`**：torch.compile 在 `_init_critics`（:103-105，CPU 上包装）时就把 critic 包进编译图，critic GRU 首次进 dynamo（CUDA 首次前向 specialize），若遇 TracingShapeError 用此退路（沙箱验证本就 false；json 默认 true，见 §7）。**已固化：§5 四条实验命令已带该 flag。**
@@ -315,9 +316,9 @@ python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
    - ⑤ **`CriticEnsemble.forward` 现有设备搬运行必须保留**：`device = get_device_from_parameters(self)`（:761）+ `observations = {k: v.to(device) for k, v in observations.items()}`（:763）在 GRU 分支中仍需先执行——§2 伪代码省略了该行（属伪代码省略而非删除）；GRU 分支应在搬移后的 observations 上取 `first_key` / `B, T`。**✅ 已确认（2026-08-14 复审，对照 sac_algorithm.py:761-763）。**
    - ⑥ **蓝图行号复核对账（2026-08-14 复审，逐行 grep 验证，实施以语义描述为准）**：核心引用**精确命中**——`td_target` 公式 :363、离散截断 :370、q_preds :371-376、`_compute_loss_actor` 的 obs_view/done_view :473-474 与 Q 调用 :479-484、`Policy.forward` else 分支 :553-555；仅 4 处小漂移：q_stats :389-398→实际 :390-398、`sequence_length` :90-96→:91-95（均差 1 行，数空行所致）、`_NonFlatteningGRU` 类定义行 :426-436→:434、`_strip_encoder_keys` 为模块级函数在 :691（蓝图并入 state_dict :624-639 一段，state_dict 本身 :624-640 无误）、learner.py 干预写离线 :1014-1016→实际 :1016-1018。
 4. 沙箱执行第 6 节验证 1-3 项，通过后提交（中文提交信息，参照历史风格）。**验证清单补一条（写入 §6）**：消融路径（B 项）下 `_compute_loss_actor` 的 Q 调用形状断言——q_preds 应为 **(2, 64)**（B 项最容易悄悄错位处，含 `actions_pi.view(B, T, -1)` 与 done 透传两条链路）。
-5. 真机实验：双关 vs R-SAC（同 6000/4000 配置，第 5 节命令）从头训练，对比成功率/干预率。
+5. 真机实验：双关 vs R-SAC（同 8500/4000 配置，第 5 节命令）从头训练，对比成功率/干预率。
 6. 实验结论（成功/失败/调参）记录回本文档第 5 节，更新 AGENTS.md 与 `命令.txt`。
-7. **[工作流，2026-08-14 起] 评估结论落盘**：每次 eval_simple.py 评估，最终结论写入**归属的 checkpoint 文件夹**、**按超参数命名**的实验记录文件（如 `gym-hil/<run>/checkpoints/006000/pretrained_model/实验记录_双关_h256_seq8_off6000_on4000.md`），本文件 §5 不替代该落盘。
+7. **[工作流，2026-08-14 起] 评估结论落盘**：每次 eval_simple.py 评估，最终结论写入**归属的 checkpoint 文件夹**、**按超参数命名**的实验记录文件（如 `gym-hil/<run>/checkpoints/006000/pretrained_model/实验记录_双关_h256_seq8_off8500_on4000.md`），本文件 §5 不替代该落盘。
 8. **[工作流，2026-08-14 起] 整体实验记录文档**：`gym-hil/实验记录_整体.md` 为算法修改决策、消融实验、评估结果的**单一总账**；每次修改算法 / 跑实验 / 评估，先登记再执行，完成后回填（与各归档文档联动）。
 
 ## 9. 仓库约定提醒（详见 AGENTS.md）

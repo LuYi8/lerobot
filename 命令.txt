@@ -116,8 +116,9 @@ python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
 配套：--algorithm.sequence_length 8（同 R-SAC；B = batch_size//T，每批帧数 64 不变）
       --algorithm.use_torch_compile false（torch.compile 包 critic，critic GRU 首次进
       dynamo 有 TracingShapeError 风险；4 条实验命令统一关闭，消融对比不含 compile 混杂因素）
-数据管线（决策 7）：--policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000
-      （总帧数 10000 恒等、内存零增长；纯 SAC / R-SAC 基线必须同配置重跑，99% 历史基线仅参考）
+数据管线（决策 7 修订，2026-08-14）：--policy.offline_buffer_capacity 8500 --policy.online_buffer_capacity 4000
+      （离线 8500 为装下 8252 帧演示的硬约束——from_lerobot_dataset 容量不足直接 ValueError；
+      总帧数 12500、内存较当前 +25%；纯 SAC / R-SAC 基线必须同配置重跑，99% 历史基线仅参考）
 详见 gym-hil/上下文归档_SAC增加GRU方案2_critic.md 第 5 节（命令全集）与 §8 待办。
 
 learner 从头训练（双关目标实验；先删 gym-hil/output）
@@ -127,12 +128,12 @@ python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume f
   --policy.policy_kwargs.recurrent_num_layers 1 \
   --algorithm.sequence_length 8 --algorithm.critic_use_recurrent true \
   --algorithm.use_torch_compile false \
-  --policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
+  --policy.offline_buffer_capacity 8500 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
 learner 从头训练（消融：仅 critic GRU；use_recurrent 不传 → 默认 false）
 python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume false \
   --algorithm.sequence_length 8 --algorithm.critic_use_recurrent true \
   --algorithm.use_torch_compile false \
-  --policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
+  --policy.offline_buffer_capacity 8500 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
 learner 从头训练（同配置基线：R-SAC 仅 actor GRU；纯 SAC 去掉 GRU 开关即可）
 python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume false \
   --policy.policy_kwargs.use_recurrent true \
@@ -140,7 +141,7 @@ python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume f
   --policy.policy_kwargs.recurrent_num_layers 1 \
   --algorithm.sequence_length 8 \
   --algorithm.use_torch_compile false \
-  --policy.offline_buffer_capacity 6000 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
+  --policy.offline_buffer_capacity 8500 --policy.online_buffer_capacity 4000 2>&1 | tee full_trace.log
 续训（用 checkpoint 内 train_config.json；critic_use_recurrent / use_torch_compile 已固化其中，无需再传 CLI）
 python -m lerobot.rl.learner --config_path gym-hil/output/checkpoints/last/pretrained_model/train_config.json --resume true 2>&1 | tee full_trace.log
 actor（critic 仅 learner 侧生效，命令与 R-SAC 相同；若追求两侧配置一致可同传 --algorithm.critic_use_recurrent true，无运行时影响）
@@ -157,3 +158,25 @@ python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
   --policy.policy_kwargs.recurrent_num_layers 1 \
   --eval.n_episodes 10 --policy.device cuda
 评估结论落盘约定：写入归属 checkpoint 文件夹、按超参数命名的实验记录（见 gym-hil/实验记录_整体.md §4）
+沙箱验证（checkpoint 异步数据集 dump：快照==同步逐帧一致/并发写不撕裂/dumper 合并语义）
+python gym-hil/tests/verify_async_dataset_dump.py
+
+—————— 无 HIL 消融实验（EXP-006/007，2026-08-14 已完成：5000 步 纯SAC 88% / R-SAC 100%）——————
+设定：去人类干预（actor 全程自动、人不按键盘）；离线 buffer=纯演示 150 集 8252 帧（离线8500/在线1500，
+      json 已带 τ=0.005，两侧算法定义已一致）；训练时 output_dir=gym-hil/output，完成后改名归档：
+      纯SAC→SACoutput150t=0.005，R-SAC→GRUoutput150t=0.005。总账见 gym-hil/实验记录_整体.md EXP-006/007。
+learner 从头训练（纯 SAC；先删 gym-hil/output）
+python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume false 2>&1 | tee full_trace.log
+learner 从头训练（R-SAC；先删 gym-hil/output）
+python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume false \
+  --policy.policy_kwargs.use_recurrent true \
+  --policy.policy_kwargs.recurrent_hidden_size 256 \
+  --policy.policy_kwargs.recurrent_num_layers 1 \
+  --algorithm.sequence_length 8 2>&1 | tee full_trace.log
+actor（无干预=人不操作键盘；R-SAC 时同传 GRU 开关保持两侧定义一致）
+python -m lerobot.rl.actor --config_path gym-hil/actor_hil_env.json 2>&1 | tee actor_trace.log
+评估（R-SAC 必须带 GRU 开关；eval_simple 目前只打印终端、不落盘不算成功率——注意人工保存/统计）
+python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
+  --policy.pretrained_path gym-hil/SACoutput150t=0.005/checkpoints/005000/pretrained_model \
+  --eval.n_episodes 100 --policy.device cuda
+
