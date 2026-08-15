@@ -94,14 +94,15 @@ python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
   - `src/lerobot/rl/algorithms/sac/sac_algorithm.py:204` — critic 更新循环（utd 内多次更新）+ Q 值统计日志（`Q1_mean`/`targetQ_mean` 等，计入 wandb）。
   - `src/lerobot/rl/learner.py` — checkpoint 数据集异步 dump（`_CheckpointDatasetDumper` 后台线程 + `_DatasetDumpTask`；`save_training_checkpoint` 提交 `clone_for_dataset()` 紧凑快照，写盘不再阻塞训练循环；无 dumper 时同步兜底）。
   - `src/lerobot/rl/buffer.py` — `clone_for_dataset()` 紧凑冻结快照（异步 dump 用：图像转 uint8 零共享，范围判定只扫 size 内槽位）。
-  - `src/lerobot/rl/eval_simple.py` — 独立评估脚本（不属于上游）。
+  - `src/lerobot/rl/eval_simple.py` — 独立评估脚本（不属于上游）；循环内按 `info["succeed"]` 计成功、`TeleopEvents.IS_INTERVENTION` 计干预（成功判据不能用 done——出界/超时也 done），结束自动落盘。
+  - `src/lerobot/rl/eval_autolog.py` — 评估自动落盘工具（不属于上游，零 torch 依赖）：超参三级回退（checkpoint 内 train_config.json > CLI cfg > unk）+ 按超参生成 `实验记录_*.md` 文件名（变体 纯SAC/RSAC/仅criticGRU/双关 + seq>1 恒带 + tau/off/on）+ md/jsonl 追加写入 checkpoint 文件夹，写失败仅告警。
 - 修改 `rl/` 或 `policies/gaussian_actor/` 时，**需同时考虑 actor/learner 两侧一致性**（两侧各自 `make_policy` 实例化策略，靠 gRPC 传参数）。
 - 新实验脚本 / 配置放在 `gym-hil/`；输出目录 `gym-hil/output*`（已 gitignore）。
 
 ## 编码 / 提交约定
 
 - 分支名、提交信息用**中文**（当前分支 `原始SAC`）；提交信息用分号列出多项改动要点（参照历史提交风格）。
-- 实验命令总结更新到 `gym-hil/命令.txt`。
+- 实验命令总结更新到根目录 `命令.txt`。
 - wandb：`wandb.enable=true`，project=`hil_test`；调试时可临时禁用。
 - 训练/评估的完整命令、参数说明以 `gym-hil/命令.txt` 和本文件为准，其他来源（如上游文档）的 HILSerl 命令可能不适用于本仓库。
 

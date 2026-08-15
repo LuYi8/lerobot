@@ -140,7 +140,8 @@ class GaussianActorPolicy(
         #修改 ============ GRU：MLP 输入维 = recurrent_hidden_size ============
         # use_recurrent=true 时 encoder 输出先过 GRU（输出维 = recurrent_hidden_size）
         # 再进 MLP，因此 MLP 输入维改用 recurrent_hidden_size（而非 encoder.output_dim，
-        # 二者默认不同：latent_dim 64 → output_dim 192，recurrent_hidden_size 256）。
+        # 二者默认不同：latent_dim 256 → output_dim 768（2 图×256+state 256），
+        # recurrent_hidden_size 256）。
         #结束 ============================================
         network_input_dim = (
             self.config.policy_kwargs.recurrent_hidden_size

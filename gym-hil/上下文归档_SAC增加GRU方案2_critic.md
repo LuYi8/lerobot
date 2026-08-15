@@ -73,7 +73,7 @@ q_values = torch.stack([q.squeeze(-1) for q in q_values], dim=0)   # (num_critic
 - **hidden 生命周期**：critic 仅在训练中使用（learner 侧），每序列零初始化、不保存；**critic 无推理路径**（select_action/eval 只用 actor 网络）→ 不需要 `_hidden` 属性、不需要 `reset()`、actor.py/eval_simple.py 零改动。
 - **target 创建/更新**：target heads+GRU 为独立实例，`load_state_dict(self.critic_ensemble.state_dict())` 自动复制 GRU 权重；`_update_target_networks` 的 EMA `zip(..., strict=True)` 遍历全部参数，GRU 参数自动纳入，**零改动**。
 - **checkpoint**：`gru.*` 键（`critic_ensemble.gru.weight_ih_l0` 等 8 个 ×2 网络）随算法 `state_dict`/`load_state_dict` 自动走（`_strip_encoder_keys` 只剥 `encoder.` 前缀，gru 键自然保留；learner.py:613 `algorithm.save_pretrained` 落盘）。
-- **计算量**：数据吞吐不变（`B×T ≤ 64` 恒定，机制现成）；GRU 参数 ≈ `4·h·(d_in+h)` = 4×256×(192+256) ≈ **46 万/网络**（d_in = encoder.output_dim 192，纯观测），online+target 两份；critic MLP 头输入 260（256+4）相对现 196 略增；相对整体策略占比小。
+- **计算量**：数据吞吐不变（`B×T ≤ 64` 恒定，机制现成）；GRU 参数 ≈ `3·h·(d_in+h)+6·h` = 3×256×1024+1536 ≈ **78.8 万/网络**（d_in = encoder.output_dim 768，纯观测；GRU 为 3 门结构，勿套用 LSTM 的 4 门公式 `4·h·(d_in+h)`），online+target 两份；critic MLP 头输入 260（256+4）相对现 772（768+4）略增；相对整体策略占比小。
 
 ## 3. 改动清单（按文件；仅 3 个文件，learner/trainer/buffer/data_mixer/actor/eval_simple **零改动**）
 

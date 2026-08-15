@@ -6,9 +6,19 @@ import torch
 from safetensors.torch import load_file
 from lerobot.configs import parser
 from lerobot.policies import make_policy, make_pre_post_processors
+from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.rl.gym_manipulator import make_robot_env, make_processors, reset_and_build_transition, step_env_and_process_transition
 from lerobot.rl.train_rl import TrainRLServerPipelineConfig
+#修改 ============ 评估结果自动落盘（工具模块，§4 约定） ============
+# 评估结束自动计算成功率并把结果追加写入 checkpoint 文件夹（md + jsonl）。
+# 逻辑全部在 eval_autolog.py（零 torch 依赖，可独立单测）；本文件只做
+# 循环内计数（成功/干预）与收尾一行调用。
+# 成功判据 = 环境每步 info["succeed"]（panda_pick env 每步计算）。
+# 不能用 done 判成功：基础环境 terminated = success or exceeded_bounds（出界
+# 也终止），HIL wrapper 还把 truncated 并入 terminated（hil_wrappers.py:246）。
+#结束 ============================================
+from lerobot.rl.eval_autolog import collect_hyperparams, dump_eval_record
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,16 +40,10 @@ def main(cfg: TrainRLServerPipelineConfig):
 
 
     # 加载权重...
+    # 注：model.safetensors 缺失时无需本地预检——make_policy 在权重加载阶段
+    # 就会抛错（目录在缺文件 → safetensors FileNotFoundError；路径不存在 →
+    # HFValidationError），不会静默拿随机权重跑评估。
     weight_path = os.path.join(cfg.policy.pretrained_path, "model.safetensors")
-    #修改 ============ 权重文件缺失直接报错 ============
-    # 原实现找不到 model.safetensors 时静默继续，会拿随机权重跑完整评估
-    # （路径写错 / last 符号链接断掉时结果完全无效且无提示）。
-    if not os.path.exists(weight_path):
-        raise FileNotFoundError(
-            f"model.safetensors not found in {cfg.policy.pretrained_path}. "
-            "Check --policy.pretrained_path."
-        )
-    #结束 ============================================
 
     state_dict = load_file(weight_path)
 
@@ -83,6 +87,12 @@ def main(cfg: TrainRLServerPipelineConfig):
 
     all_rewards = []
     all_steps = []
+    #修改 ============ 成功/干预逐步计数（自动落盘数据源） ============
+    # 成功判据见文件头注释；干预计数沿用 actor.py 同款读法
+    # info.get(TeleopEvents.IS_INTERVENTION)，按步累计、口径与 actor 一致。
+    #结束 ============================================
+    all_success = []
+    all_intv_steps = []
 
     for ep in range(n_episodes):
 
@@ -97,6 +107,10 @@ def main(cfg: TrainRLServerPipelineConfig):
         ep_reward = 0.0
         step = 0
         done = False
+        #修改 ============ episode 级成功/干预累计 ============
+        ep_success = False
+        ep_intv_steps = 0
+        #结束 ============================================
 
         while not done:
 
@@ -124,15 +138,35 @@ def main(cfg: TrainRLServerPipelineConfig):
             transition = new_transition
             obs = new_transition['observation']
 
+            #修改 ============ 逐步读取成功/干预状态 ============
+            info = new_transition.get('info') or {}
+            if info.get("succeed", False):
+                ep_success = True
+            if info.get(TeleopEvents.IS_INTERVENTION, False):
+                ep_intv_steps += 1
+            #结束 ============================================
+
         all_rewards.append(ep_reward)
         all_steps.append(step)
+        all_success.append(ep_success)
+        all_intv_steps.append(ep_intv_steps)
         print(f"Episode {ep+1}: reward={ep_reward:.2f}, steps={step}")
 
 
+    n_success = sum(1 for s in all_success if s)
     print(f"\n===== Evaluation Summary =====")
     print(f"Episodes: {n_episodes}")
     print(f"Average reward: {sum(all_rewards)/len(all_rewards):.3f}")
     print(f"Average steps: {sum(all_steps)/len(all_steps):.1f}")
+    #修改 ============ Summary 增打成功率 + 自动落盘 ============
+    print(f"Success rate: {n_success}/{n_episodes} ({n_success/n_episodes:.1%})")
+    hp = collect_hyperparams(cfg.policy.pretrained_path, cfg)
+    dump_eval_record(
+        cfg.policy.pretrained_path,
+        hp,
+        list(zip(all_rewards, all_steps, all_success, all_intv_steps)),
+    )
+    #结束 ============================================
     env.close()
     print("Evaluation finished successfully.")
     time.sleep(1)   # 让终端显示

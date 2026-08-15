@@ -169,7 +169,7 @@ python -m lerobot.rl.actor --config_path gym-hil/actor_hil_env.json \
 
 | 位置 | 蓝图写法 | 实际实现 | 原因 |
 |---|---|---|---|
-| §3.3 `_init_actor` | 未提 MLP 输入维（隐含假设 recurrent_hidden_size 256 == encoder.output_dim） | use_recurrent 时 `MLP(input_dim=recurrent_hidden_size)` | 本仓库 `latent_dim=64` → `encoder.output_dim=192`（2 图×64+state 64），与 256 不等；蓝图假设在本配置下不成立 |
+| §3.3 `_init_actor` | 未提 MLP 输入维（隐含假设 recurrent_hidden_size 256 == encoder.output_dim） | use_recurrent 时 `MLP(input_dim=recurrent_hidden_size)` | 本仓库 `latent_dim=256` → `encoder.output_dim=768`（2 图×256+state 256），与 256 不等；蓝图假设在本配置下不成立 |
 | §3.6 `_compute_loss_critic` | 对 (B, T) 的 done 直接 `done[:, 1:]` 左移 | 先 `done.view(B, T)` 再左移 | `_prepare_forward_batch` 已把 done 展平为 (B*T,)，直接左移会 shape 崩溃（验证脚本捕获） |
 
 **§6 验证结果**（测试脚本归档于 `gym-hil/tests/`，重跑命令见各文件头注释）：

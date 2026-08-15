@@ -175,7 +175,7 @@ python -m lerobot.rl.learner --config_path gym-hil/train_hil_env.json --resume f
   --algorithm.sequence_length 8 2>&1 | tee full_trace.log
 actor（无干预=人不操作键盘；R-SAC 时同传 GRU 开关保持两侧定义一致）
 python -m lerobot.rl.actor --config_path gym-hil/actor_hil_env.json 2>&1 | tee actor_trace.log
-评估（R-SAC 必须带 GRU 开关；eval_simple 目前只打印终端、不落盘不算成功率——注意人工保存/统计）
+评估（R-SAC 必须带 GRU 开关；eval_simple 自动落盘：成功判据=环境每步 info["succeed"]，结果按超参命名追加写入 checkpoint 文件夹 实验记录_*.md + eval_results.jsonl，命令本身不变；成功/结论的语境段（如"无HIL"）与总账登记仍人工）
 python -m lerobot.rl.eval_simple --config_path gym-hil/actor_hil_env.json \
   --policy.pretrained_path gym-hil/SACoutput150t=0.005/checkpoints/005000/pretrained_model \
   --eval.n_episodes 100 --policy.device cuda
